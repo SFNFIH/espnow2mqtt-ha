@@ -1,0 +1,28 @@
+{
+  "title": "ESP-NOW 2 MQTT",
+  "config": {
+    "step": {
+      "user": {
+        "title": "ESP-NOW 2 MQTT",
+        "description": "通过 MQTT 连接 USB 协调器桥接。请先安装 ESP-NOW 2 MQTT 插件（Add-on）或自行运行 bridge。设备会自动出现，无需编写实体配置。",
+        "data": {
+          "base_topic": "MQTT 主题前缀"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "ESP-NOW 2 MQTT 已配置",
+      "mqtt_not_ready": "尚未配置 MQTT 集成，请先添加 MQTT"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ESP-NOW 2 MQTT 选项",
+        "data": {
+          "base_topic": "MQTT 主题前缀"
+        }
+      }
+    }
+  }
+}

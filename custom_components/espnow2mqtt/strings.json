@@ -1,0 +1,28 @@
+{
+  "title": "ESP-NOW 2 MQTT",
+  "config": {
+    "step": {
+      "user": {
+        "title": "ESP-NOW 2 MQTT",
+        "description": "Connect to the USB coordinator bridge over MQTT. Install the ESP-NOW 2 MQTT add-on (or run the bridge) first. Devices appear automatically — no YAML.",
+        "data": {
+          "base_topic": "MQTT base topic"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "ESP-NOW 2 MQTT is already configured",
+      "mqtt_not_ready": "MQTT integration is not set up. Add MQTT first."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ESP-NOW 2 MQTT options",
+        "data": {
+          "base_topic": "MQTT base topic"
+        }
+      }
+    }
+  }
+}
