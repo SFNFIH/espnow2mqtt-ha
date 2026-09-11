@@ -22,8 +22,9 @@
 8. [Cover](#8-cover)
 9. [Lock](#9-lock)
 10. [Climate](#10-climate)
-11. [Bridge 连通性实体](#11-bridge-连通性实体)
-12. [按设备类型看会出什么](#12-按设备类型看会出什么)
+11. [Event（按钮）](#11-event按钮)
+12. [Bridge 连通性实体](#12-bridge-连通性实体)
+13. [按设备类型看会出什么](#13-按设备类型看会出什么)
 
 ---
 
@@ -48,28 +49,15 @@
 | `illuminance` | sensor | `EspNowSensor` | `"illuminance" in caps` |
 | `power` | sensor | `EspNowSensor` | `"power" in caps` |
 | `energy` | sensor | `EspNowSensor` | `"energy" in caps` |
+| `button` | **event** | `EspNowButtonEvent` | `"button" in caps` |
 | — | sensor | `EspNowSensor` | **无条件**：`hop`、`node_role` |
 | — | sensor | `EspNowSensor` | `dev.rssi is not None or "rssi" in dev.state` → `rssi` |
 
-### 1.1 `button` cap 不产生任何实体
+每个实体类还带一个 `_requires_cap`，值就是表里的 `cap`
+（诊断实体是 `None`）。cap 消失时实体会据此自删，
+见 [state-flow.md §6](state-flow.md#6-实体能增也能减)。
 
-`hub.py` 的 caps 推断列表里有 `"button"`，但**没有任何平台处理它**：
-
-- `SENSOR_SPECS` 里没有 `button`
-- `BINARY_SPECS` 里没有 `button`
-- 也没有 `event` 平台
-
-所以一个报 `{"button":"single","caps":["button"]}` 的设备在 HA 里
-**只会出现三个诊断实体**（hop / node_role / rssi），按键事件拿不到。
-
-想用的话有两条路：
-
-1. 在 HA 里直接订阅 MQTT 主题做自动化
-   （见 [usage.md §6](usage.md#6-绕过集成直接用-mqtt)）
-2. 改代码：给 `sensor.py` 的 `SENSOR_SPECS` 加一条 `"button"`，
-   或者更正确地实现一个 `event` 平台
-
-### 1.2 `light` 和 `switch` 互斥
+### 1.1 `light` 和 `switch` 互斥
 
 Hub 在 `_on_device_state` 里做了两件事（见
 [state-flow.md §3.5](state-flow.md#35-灯优先于开关)）：
@@ -80,17 +68,18 @@ Hub 在 `_on_device_state` 里做了两件事（见
 配合 `switch.py` 的 `"light" not in dev.caps` 条件，一个调光灯只出
 **Light** 实体。
 
-**但如果 Switch 实体在亮度字段到达之前就建好了，它不会被删除**——
-你会看到同一个设备上有 `switch.x_switch` 和 `light.x_light` 两个实体。
-见 [state-flow.md §6](state-flow.md#6-实体只增不减)。
+如果 Switch 实体在亮度字段到达之前就建好了，它会在升级发生时**自删**
+（`EspNowSwitch._requires_cap = "switch"`，而 `switch` 刚被从 caps 里拿掉）。
+见 [state-flow.md §6](state-flow.md#6-实体能增也能减)。
 
-### 1.3 诊断实体总是有
+### 1.2 诊断实体总是有
 
 `sensor.py`：
 
 ```python
-wanted = set(dev.caps) | {"hop", "node_role"}
-if dev.rssi is not None or "rssi" in dev.state:
+wanted = {"hop", "node_role"}
+wanted.update(cap for cap in device.caps if cap in SENSOR_SPECS)
+if device.rssi is not None or "rssi" in device.state:
     wanted.add("rssi")
 ```
 
@@ -99,20 +88,30 @@ if dev.rssi is not None or "rssi" in dev.state:
 `RSSI` 要等 `bridge/devices` 到达（那是 RSSI 的唯一来源）。
 
 这三个都带 `EntityCategory.DIAGNOSTIC`，在 HA 的设备页会被折叠到
-"诊断"区，不占主界面。
+"诊断"区，不占主界面。也正因为它们不依赖任何能力，
+它们的 `_requires_cap` 是 `None`，永远不会自删。
 
-### 1.4 测量类 key 的额外过滤
+### 1.3 测量量 vs 诊断量
+
+`SENSOR_SPECS` 里每条规格都有一个 `measurement` 标志：
 
 ```python
-_MEASUREMENT_KEYS = ("temperature", "humidity", "pressure", "illuminance", "power", "energy")
-...
-if key in _MEASUREMENT_KEYS and key not in dev.caps:
-    continue
+@dataclass(frozen=True)
+class SensorSpec:
+    name: str
+    device_class: SensorDeviceClass | None = None
+    state_class: SensorStateClass | None = None
+    unit: str | None = None
+    category: EntityCategory | None = None
+    precision: int | None = None
+    measurement: bool = False
+
+_MEASUREMENT_KEYS = tuple(k for k, s in SENSOR_SPECS.items() if s.measurement)
 ```
 
-看起来冗余（`wanted` 就是从 `dev.caps` 来的），但它挡住了一种情况：
-如果以后有人往 `wanted` 里加了别的来源，测量类实体仍然只在
-caps 明确声明时才创建。防御性代码。
+测量量只在 caps 明确声明时创建，并且 `_requires_cap` 设成自己的键；
+诊断量两者都不做。这个区分只写一处（规格里的那个布尔值），
+上面那行 `_MEASUREMENT_KEYS` 是从它推出来的，不会和规格表脱节。
 
 ---
 
@@ -257,45 +256,43 @@ _attr_max_color_temp_kelvin = 6500
 >
 > 影响很小（设备侧会夹），但 UI 上会有一小段"拉了没变化"的死区。
 
-### 3.3 色彩模式的判定有个时序坑
+### 3.3 色彩模式是每次读时判定的
 
 ```python
-def __init__(self, hub, device):
-    super().__init__(hub, device, "light")
-    modes: set[ColorMode] = {ColorMode.BRIGHTNESS}
-    if "color_temp" in device.state or "color_temp" in device.caps:
-        modes = {ColorMode.COLOR_TEMP}
-    self._attr_supported_color_modes = modes
-    self._attr_color_mode = next(iter(modes))
+def _is_cct(self) -> bool:
+    return (
+        "color_temp" in self._device.state
+        or "color_temp" in self._device.caps
+        or str(self._device.state.get("color_mode", "")).lower() == "color_temp"
+    )
+
+@property
+def supported_color_modes(self) -> set[ColorMode]:
+    return {ColorMode.COLOR_TEMP} if self._is_cct() else {ColorMode.BRIGHTNESS}
+
+@property
+def color_mode(self) -> ColorMode:
+    return ColorMode.COLOR_TEMP if self._is_cct() else ColorMode.BRIGHTNESS
 ```
 
-**色彩模式是在实体创建的那一刻决定的，之后不会自动更新。**
-
-| 创建时 `state` 里有 `color_temp`？ | 支持的模式 |
+| `state` 里有 `color_temp` 或 `color_mode: "color_temp"`？ | 支持的模式 |
 |---|---|
 | 有 | `{COLOR_TEMP}`（HA 的 COLOR_TEMP 隐含支持亮度） |
-| 没有 | `{BRIGHTNESS}`——**只有亮度滑条，没有色温滑条** |
+| 没有 | `{BRIGHTNESS}`——只有亮度滑条 |
 
-所以如果实体是在一条"被 160 字节挤掉了 `color_temp`"的上报上建出来的，
-它会永远是纯调光灯。
+两种模式不能并列：HA 里 `COLOR_TEMP` 已经含亮度，把 `BRIGHTNESS`
+和它放一起是非法组合。
 
-`async_turn_on` 里有个运行时补救：
+因为是属性而不是构造时的快照，**一条晚到的带 `color_temp` 的上报
+就能让色温滑条出现**，不需要重启 HA。`color_mode` 这个键也算，
+因为 `en2m` 的 ColorControl cluster 会同时发
+`{"color_mode":"color_temp","color_temp":370}`。
 
-```python
-if ATTR_COLOR_TEMP_KELVIN in kwargs:
-    payload["color_temp"] = _kelvin_to_mireds(kelvin)
-    self._attr_color_mode = ColorMode.COLOR_TEMP
-    self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
-```
-
-但这是**鸡生蛋**——用户得先能设色温，才能触发这段代码，
-而色温滑条在 UI 上根本没出现。
-
-**实际解法：重启 HA。** 重启后实体重新构造，这次 `dev.state`
-是从 retained 的 `<slug>/state` 恢复的，通常已经包含 `color_temp`。
-
-更彻底的修法是在 `_handle_update` 里重算 `supported_color_modes`，
-当前版本没做。
+> 0.3.x 里这两个值是在 `__init__` 里算一次就定死的。
+> 如果实体是在一条"被 160 字节挤掉了 `color_temp`"的上报上建出来的，
+> 它会**永远**是纯调光灯。`async_turn_on` 里有段运行时补救，
+> 但那是鸡生蛋——用户得先能设色温才能触发它，而色温滑条根本没出现。
+> 唯一的解法是重启 HA 让实体重新构造。
 
 ---
 
@@ -319,7 +316,7 @@ class EspNowSwitch(EspNowEntity, SwitchEntity):
 要区分就看实体的 `available` 属性。
 
 创建条件是 `"switch" in caps and "light" not in caps`，见
-[§1.2](#12-light-和-switch-互斥)。
+[§1.2](#11-light-和-switch-互斥)。
 
 ---
 
@@ -327,17 +324,21 @@ class EspNowSwitch(EspNowEntity, SwitchEntity):
 
 `SENSOR_SPECS` 是一张表驱动的字典：
 
-| key | 名称 | device_class | state_class | 单位 | 类别 |
-|---|---|---|---|---|---|
-| `temperature` | Temperature | `TEMPERATURE` | `MEASUREMENT` | °C | — |
-| `humidity` | Humidity | `HUMIDITY` | `MEASUREMENT` | % | — |
-| `pressure` | Pressure | `PRESSURE` | `MEASUREMENT` | hPa | — |
-| `illuminance` | Illuminance | `ILLUMINANCE` | `MEASUREMENT` | lx | — |
-| `power` | Power | `POWER` | `MEASUREMENT` | W | — |
-| `energy` | Energy | `ENERGY` | **`TOTAL_INCREASING`** | Wh | — |
-| `hop` | Mesh Hop | — | — | — | `DIAGNOSTIC` |
-| `rssi` | RSSI | `SIGNAL_STRENGTH` | — | dBm | `DIAGNOSTIC` |
-| `node_role` | Node Role | — | — | — | `DIAGNOSTIC` |
+| key | 名称 | device_class | state_class | 单位 | 类别 | 小数位 |
+|---|---|---|---|---|---|:-:|
+| `temperature` | Temperature | `TEMPERATURE` | `MEASUREMENT` | °C | — | 1 |
+| `humidity` | Humidity | `HUMIDITY` | `MEASUREMENT` | % | — | 1 |
+| `pressure` | Pressure | `PRESSURE` | `MEASUREMENT` | hPa | — | 1 |
+| `illuminance` | Illuminance | `ILLUMINANCE` | `MEASUREMENT` | lx | — | 0 |
+| `power` | Power | `POWER` | `MEASUREMENT` | W | — | 1 |
+| `energy` | Energy | `ENERGY` | **`TOTAL_INCREASING`** | Wh | — | 2 |
+| `hop` | Mesh Hop | — | — | — | `DIAGNOSTIC` | 0 |
+| `rssi` | RSSI | `SIGNAL_STRENGTH` | — | dBm | `DIAGNOSTIC` | 0 |
+| `node_role` | Node Role | — | — | — | `DIAGNOSTIC` | — |
+
+"小数位"那一列就是 `SensorSpec.precision`，直接落到
+`_attr_suggested_display_precision`。它是**建议值**：
+用户在实体设置里改过之后，HA 的实体注册表会记住用户的选择并覆盖它。
 
 ### 5.1 没有单位换算
 
@@ -347,14 +348,18 @@ class EspNowSwitch(EspNowEntity, SwitchEntity):
 集成只做 `float()`：
 
 ```python
-if key in _MEASUREMENT_KEYS:
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
+val = self._device.state.get(key)
+if val is None:
+    return None
+try:
+    return float(val)
+except (TypeError, ValueError):
+    return None
 ```
 
 换算失败返回 `None` → HA 显示 `unknown`，不会报错。
+（`hop` / `rssi` / `node_role` 在这段之前就已经 return 了，
+所以走到这里的一定是测量量。）
 
 ### 5.2 `energy` 是 `TOTAL_INCREASING`
 
@@ -388,20 +393,26 @@ if key == "node_role":
 RSSI 的刷新频率 = `bridge/devices` 的重写频率。Bridge 每收到一条
 `device` 行就重写，即**每个设备每 30 秒一次**。
 
-### 5.4 `SENSOR_SPECS` 里的 precision 字段没被用
-
-每条 spec 是 6 元组，最后一个是精度：
+### 5.4 规格是数据类，不是元组
 
 ```python
-name, device_class, state_class, unit, category, _prec = SENSOR_SPECS[key]
+spec = SENSOR_SPECS[key]
+self._attr_name = spec.name
+self._attr_device_class = spec.device_class
+self._attr_state_class = spec.state_class
+self._attr_native_unit_of_measurement = spec.unit
+self._attr_entity_category = spec.category
+self._attr_suggested_display_precision = spec.precision
+if spec.measurement:
+    self._requires_cap = key
 ```
 
-`_prec` 解包出来就**再也没有用过**（下划线前缀已经暗示了）。
-所以温度显示的小数位数由 HA 根据 `device_class` 自己决定，
-而不是这张表里写的 1 位。
-
-想生效得加 `self._attr_suggested_display_precision = _prec`。
-当前版本没做。
+> 0.3.x 里每条规格是个 6 元组，解包成
+> `name, device_class, state_class, unit, category, _prec`。
+> 那个 `_prec` **解包出来就再也没用过**（下划线前缀已经暗示了），
+> 于是小数位数全由 HA 根据 `device_class` 自己猜，表里写的值是装饰。
+> 改成 `SensorSpec` 数据类之后每个字段都有名字，
+> 少用一个就是显眼的死字段，不会再悄悄烂掉。
 
 ---
 
@@ -539,38 +550,42 @@ _attr_supported_features = (
 所以代码里到处是 `100 - x`：
 
 ```python
-def _closed_pct(self) -> int:
+def _closed_pct(self) -> int | None:
     raw = self._device.state.get("position")
     try:
         return max(0, min(100, int(raw)))
     except (TypeError, ValueError):
-        cover = str(self._device.state.get("cover", "OPEN")).upper()
-        return 100 if cover == "CLOSED" else 0
+        pass
+    cover = str(self._device.state.get("cover", "")).upper()
+    if cover == "CLOSED":
+        return 100
+    if cover == "OPEN":
+        return 0
+    return None
 
 @property
 def current_cover_position(self) -> int | None:
-    # HA: 0 = closed, 100 = open
-    return 100 - self._closed_pct()
-
-@property
-def is_closed(self) -> bool:
-    return self._closed_pct() >= 95
+    closed = self._closed_pct()
+    return None if closed is None else 100 - closed
 
 async def async_set_cover_position(self, **kwargs) -> None:
-    open_pct = int(kwargs.get("position", 0))
-    closed = max(0, min(100, 100 - open_pct))
-    await self._hub.async_publish_set(self._device, {"position": closed})
+    open_pct = max(0, min(100, int(kwargs.get(ATTR_POSITION, 0))))
+    await self._hub.async_publish_set(self._device, {"position": 100 - open_pct})
 ```
 
-对照表：
+对照表（`is_closed` 那一列见 [§8.2](#82-is_closed-由设备说了算)）：
 
-| 物理状态 | 固件 `position` | HA `current_cover_position` | `is_closed` |
-|---|---:|---:|:-:|
-| 全开 | 0 | 100 | ✗ |
-| 开 70% | 30 | 70 | ✗ |
-| 半开 | 50 | 50 | ✗ |
-| 关 95% | 95 | 5 | **✓** |
-| 全关 | 100 | 0 | ✓ |
+| 物理状态 | 固件 `position` | 固件 `cover` | HA `current_position` | `is_closed` |
+|---|---:|---|---:|:-:|
+| 全开 | 0 | `OPEN` | 100 | ✗ |
+| 开 70% | 30 | `OPEN` | 70 | ✗ |
+| 半开 | 50 | `OPEN` | 50 | ✗ |
+| 关 97% | 97 | `CLOSED` | 3 | **✓** |
+| 全关 | 100 | `CLOSED` | 0 | ✓ |
+
+> 注意 HA 里这个属性叫 **`current_position`**，不是
+> `current_cover_position`（后者是 Python 里的属性名）。
+> 写模板时用 `state_attr('cover.x_cover', 'current_position')`。
 
 > **在 MQTT 上手工发命令时一定要注意这个反转。**
 >
@@ -584,26 +599,44 @@ async def async_set_cover_position(self, **kwargs) -> None:
 > `{"position":50}` 恰好是半开（50 两边一样），所以那个例子看不出问题。
 > 非 50 的值一定要换算。
 
-### 8.2 `is_closed` 的 95 阈值
+### 8.2 `is_closed` 由设备说了算
 
-`_closed_pct() >= 95` 而不是 `== 100`，是为了容忍电机的机械误差——
-关到 96% 就该算关好了。
+```python
+@property
+def is_closed(self) -> bool | None:
+    cover = str(self._device.state.get("cover", "")).upper()
+    if cover in ("OPEN", "CLOSED"):
+        return cover == "CLOSED"
+    position = self.current_cover_position
+    return None if position is None else position == 0
+```
 
-**这个阈值和固件侧推导 `cover` 字段用的是同一个值**
-（device 仓库 `en2m_model.c` 里 `v >= 95 ? "CLOSED" : "OPEN"`），
-所以两边判断一致。
+**优先信设备自己的判断。** 固件在
+`en2m_model.c` 里用 `v >= 95 ? "CLOSED" : "OPEN"` 推出 `cover` 字段，
+容忍电机的机械误差——关到 97% 对一个卷帘来说就是关好了。
+集成不该在这上面再加一个自己的阈值去和设备争。
+
+只有在设备没报 `cover` 字段时才退回看位置，这时用 HA 的标准语义
+（`current_position == 0`）。
+
+> 0.3.x 里这里写的是 `self._closed_pct() >= 95`，等于把固件的阈值
+> 抄了一份到 HA。抄对了没问题，但两处就有两处要维护，
+> 而且**和它自己报出去的 `current_position` 会矛盾**：
+> 位置 3% 时 HA 前端的滑条不在底，图标却显示已关闭。
 
 ### 8.3 `position` 缺失时的回退
 
-`_closed_pct()` 的 `except` 分支读 `cover` 字段
+`_closed_pct()` 读不到 `position` 就看 `cover` 字段
 （`"OPEN"` / `"CLOSED"`），映射成 0 / 100。
 
 这让**不支持位置反馈的窗帘**（只报开/关）也能工作，
 只是 HA 的位置滑条会在 0 和 100 之间跳。
 
-注意回退分支的默认是 `"OPEN"` → 0（全开）。
-所以一个既没有 `position` 也没有 `cover` 字段的设备，
-在 HA 里显示为"全开"而不是 unknown。
+两个字段都没有时返回 `None`，HA 显示 unknown。
+
+> 0.3.x 的回退默认值是 `"OPEN"` → 0（全开），
+> 所以一个既没 `position` 也没 `cover` 的设备会**显示成"全开"**——
+> 一个它从没说过的状态。现在这种情况老实显示 unknown。
 
 ### 8.4 命令用的是字符串不是位置
 
@@ -629,10 +662,14 @@ async def async_set_cover_position(self, **kwargs) -> None:
 ```python
 class EspNowLock(EspNowEntity, LockEntity):
     _attr_name = "Lock"
+    _requires_cap = "lock"
 
     @property
-    def is_locked(self) -> bool:
-        return str(self._device.state.get("lock", "UNLOCKED")).upper() == "LOCKED"
+    def is_locked(self) -> bool | None:
+        raw = self._device.state.get("lock")
+        if raw is None:
+            return None
+        return str(raw).upper() == "LOCKED"
 
     async def async_lock(self, **kwargs) -> None:
         await self._hub.async_publish_set(self._device, {"lock": "LOCK"})
@@ -663,6 +700,9 @@ Hub 的归一化会把 `LOCK` 也认成 `LOCKED`，所以即使固件把命令�
 ## 10. Climate
 
 ```python
+#: Exactly the modes `en2m_hvac_mode_str()` can emit and `en2m_hvac_mode_parse()`
+#: can accept. Advertising more would let HA send a mode the device silently
+#: turns into "off".
 _MODE_MAP = {
     "off": HVACMode.OFF,
     "auto": HVACMode.AUTO,
@@ -672,39 +712,80 @@ _MODE_MAP = {
 }
 _MODE_REV = {v: k for k, v in _MODE_MAP.items()}
 
+#: What `turn_on` means for a thermostat that has no separate power switch.
+_DEFAULT_ON_MODE = HVACMode.AUTO
+
 class EspNowClimate(EspNowEntity, ClimateEntity):
     _attr_name = "Thermostat"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
     _attr_hvac_modes = list(_MODE_MAP.values())
     _attr_min_temp = 5
     _attr_max_temp = 35
     _attr_target_temperature_step = 0.5
+    _requires_cap = "climate"
 ```
 
 | HA 属性 | 读哪个字段 | 备注 |
 |---|---|---|
-| `hvac_mode` | `hvac_mode` | 通过 `_MODE_MAP` 映射，**认不出来的一律变 `OFF`** |
+| `hvac_mode` | `hvac_mode` | 通过 `_MODE_MAP` 映射，**认不出来的返回 `None`**（见 [§10.1](#101-模式表和固件一一对应)） |
 | `current_temperature` | `current_temperature`，**回退到 `temperature`** | `float()`，失败返回 `None` |
 | `target_temperature` | `target_temperature` | 同上 |
 
 | HA 操作 | payload |
 |---|---|
-| `set_hvac_mode(M)` | `{"hvac_mode":<_MODE_REV[M] or "off">}` |
+| `set_hvac_mode(M)` | `{"hvac_mode":<_MODE_REV[M]>}`，M 不在表里则**什么都不发** |
 | `set_temperature(temperature=T)` | `{"target_temperature":<float>}` |
+| `turn_on()` | `{"hvac_mode":"auto"}` |
+| `turn_off()` | `{"hvac_mode":"off"}` |
 
-### 10.1 只支持 5 种模式
+`TURN_ON` / `TURN_OFF` 是给 `climate.turn_on` / `climate.turn_off` 这两个
+service 用的。温控器没有独立的电源开关，所以"开"被定义成切到 `auto`
+（`_DEFAULT_ON_MODE`）——让设备自己决定是制冷还是制热。
 
-`_MODE_MAP` 只有 off / auto / cool / heat / fan_only。
+### 10.1 模式表和固件一一对应
 
-Matter 的 `SystemMode` 还有 `dry(8)`、`precooling(5)`、
-`emergency_heat(6)`、`sleep(9)`。**如果固件报了这些值，
-`_MODE_MAP.get(raw, HVACMode.OFF)` 会让 HA 显示成 OFF**——
-而设备实际在运行。
+`_MODE_MAP` 只有 off / auto / cool / heat / fan_only，
+这**不是漏了**，而是刻意和固件的
+`en2m_hvac_mode_str()` / `en2m_hvac_mode_parse()` 对齐
+（device 仓库 `components/espnow_device/src/en2m_types.c`）。
 
-表现：温控器在 HA 里显示"关闭"但房间在制冷。
-要支持就往 `_MODE_MAP` 里加条目
-（`HVACMode.DRY`、`HVACMode.HEAT_COOL` 等）。
+Matter 的 `SystemMode` 确实还有 `dry(8)`、`precooling(5)`、
+`emergency_heat(6)`、`sleep(9)`，但 `en2m` 固件不发这些字符串、
+也不认这些字符串。如果在 `_attr_hvac_modes` 里多列几个，
+结果是 HA 里能选 "Dry"、发出去 `{"hvac_mode":"dry"}`、
+固件 parse 失败当成 `off` 处理——**UI 上能选但按下去把设备关了**。
+所以下行方向这里宁缺毋滥：`_MODE_REV.get()` 返回 `None` 时
+`async_set_hvac_mode` 直接 return，一个字节都不发。
+
+上行方向则相反，要防的是"猜错"：
+
+```python
+@property
+def hvac_mode(self) -> HVACMode | None:
+    raw = self._device.state.get("hvac_mode")
+    if raw is None:
+        return None
+    # An unrecognised mode used to be reported as "off", which is an active
+    # lie about a running thermostat. Returning None shows it as unknown.
+    return _MODE_MAP.get(str(raw).lower())
+```
+
+> **0.3.x 里**这行是 `_MODE_MAP.get(str(raw).lower(), HVACMode.OFF)`。
+> 一个报了 `"dry"` 的定制固件会让 HA 显示"关闭"，
+> 而房间里的机器正在除湿。你据此写的
+> "温控器关了就关窗"自动化会在最糟的时候触发。
+>
+> 现在返回 `None`，HA 显示 `unknown`。这在自动化里很好区分：
+> `is_state('climate.x', 'off')` 对 `unknown` 不成立，
+> 而 `unknown` 本身就是"固件报了个我不认识的模式"的信号。
+
+要真正支持更多模式，两侧都得改：固件的 `en2m_hvac_mode_str()` 加输出、
+`_MODE_MAP` 加条目。只改一侧都会出上面那两种问题之一。
 
 ### 10.2 `current_temperature` 会回退到 `temperature`
 
@@ -750,13 +831,143 @@ val = self._device.state.get("current_temperature", self._device.state.get("temp
 `step = 0.5` 和固件的精度对得上：固件内部用 ÷100 的定点整数，
 所以 0.5 °C 能精确表示。
 
-`ClimateEntityFeature` 里的 `FAN_MODE` / `PRESET_MODE` /
-`SWING_MODE` / `TURN_ON` / `TURN_OFF` 都没有实现。
-关掉温控器要用 `set_hvac_mode("off")`。
+`ClimateEntityFeature` 里的 `FAN_MODE` / `PRESET_MODE` / `SWING_MODE`
+没有实现——固件的 Thermostat cluster 也没有对应的可写属性。
+`TURN_ON` / `TURN_OFF` 有，见 [§10](#10-climate) 的操作表。
 
 ---
 
-## 11. Bridge 连通性实体
+## 11. Event（按钮）
+
+按钮是唯一一个**没有状态**的能力。等 HA 听说这件事的时候，
+按下和松开都已经结束了。把它做成 sensor 的话，
+值会永远停在最后一次按的那个数上——所以它走 HA 的 `event` 平台，
+记录的是"什么时候发生了哪一种按法"，而不是"现在是什么值"。
+
+```python
+EVENT_TYPES = ["press", "double_press", "long_press", "release"]
+
+class EspNowButtonEvent(EspNowEntity, EventEntity):
+    _attr_name = "Button"
+    _attr_event_types = EVENT_TYPES
+    _requires_cap = "button"
+
+    def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
+        super().__init__(hub, device, "button")
+        self._last = self._fingerprint()
+
+    def _fingerprint(self) -> tuple:
+        state = self._device.state
+        return (state.get("button"), state.get("button_action"))
+```
+
+| | |
+|---|---|
+| 实体 ID | `event.<设备名>_button` |
+| unique_id | `<MAC>_button` |
+| 创建条件 | `"button" in caps` |
+| 读哪些字段 | `button`（必须）、`button_action`（可选） |
+| 事件类型 | `press`、`double_press`、`long_press`、`release` |
+| 命令 | **没有**，这是纯上行实体 |
+
+> **0.3.x 里 `button` cap 走到 Hub 就没人接了。**
+> Hub 会老老实实把它放进 `dev.caps`、在 `espnow2mqtt_mac` 属性里
+> 也能看到，但八个平台没有一个认领它，
+> 所以一个只声明 `["button"]` 的设备在 HA 里**只有三个诊断实体**，
+> 按键按了完全没有反应。当时的解法只能是在 MQTT 层面写自动化
+> （`platform: mqtt` + `topic: espnow2mqtt/<slug>/state`），
+> 绕开整个集成。
+
+### 11.1 为什么必须把 `button` 报成计数器
+
+`<slug>/state` 是 **retained** 的，而且固件每次上报都会把全部字段重发一遍
+（见 [state-flow.md §10](state-flow.md#10-ha-重启后会发生什么)）。
+这带来一个硬性限制：
+
+**一次按键只能被识别成 `button` 值的"变化"。**
+
+连续两条一模一样的值，和"同一条消息被重发"在 MQTT 层面
+是完全无法区分的。所以设备侧的正确做法是把 `button` 当成
+**一个每次按键都自增的计数器**：
+
+```json
+{"button": 7, "button_action": "double_press"}
+```
+
+下一次按就是 `{"button": 8, ...}`。指纹是
+`(button, button_action)` 这个二元组，任一个变了就发事件。
+
+| 固件这么报 | 结果 |
+|---|---|
+| `{"button": 1}`、`{"button": 2}`、`{"button": 3}` | 3 个 `press` 事件 ✅ |
+| `{"button": "press"}` 连发三次 | **只有第 1 个**触发事件 ❌ |
+| `{"button": 1, "button_action": "press"}` 然后 `{"button": 1, "button_action": "long_press"}` | 2 个事件（`press` + `long_press`）✅ |
+
+另外 `current[0] is not None` 这个条件保证了：
+HA 重启后 retained 的 `<slug>/state` 被重放时，
+`__init__` 里已经把 `self._last` 设成了当时的指纹，
+所以**不会凭一条 retained 消息伪造出一次按键**。
+
+### 11.2 事件类型是归一化的
+
+固件报什么 `button_action` 字符串都行，集成会折叠到四种之一：
+
+```python
+_ALIASES = {
+    "single": "press", "single_press": "press", "click": "press",
+    "pressed": "press", "short": "press", "short_press": "press",
+    "double": "double_press", "double_click": "double_press",
+    "hold": "long_press", "long": "long_press", "held": "long_press",
+    "released": "release",
+}
+
+@staticmethod
+def _event_type(raw: object) -> str:
+    value = _ALIASES.get(str(raw).strip().lower(), str(raw).strip().lower())
+    return value if value in EVENT_TYPES else "press"
+```
+
+认不出来的一律当 `press`。这里和 climate 的取舍**正好相反**——
+按键是纯上行、没有副作用，"漏报一次按键"比"报错按法"更糟，
+所以宁滥毋缺。
+
+没有 `button_action` 时，`_event_type` 拿到的是 `button` 本身的值
+（通常是个整数），也会落到 `press`。所以**只报计数器不报按法
+的设备会得到一串 `press` 事件**，这是正确的降级。
+
+### 11.3 事件的 `event_type` 和属性
+
+`_trigger_event` 带了两个额外属性：
+
+```python
+self._trigger_event(
+    self._event_type(...),
+    {"value": current[0], "action": current[1]},
+)
+```
+
+所以在自动化里能同时拿到归一化后的类型和固件的原话：
+
+```yaml
+trigger:
+  - platform: state
+    entity_id: event.kitchen_button_button
+condition:
+  - "{{ trigger.to_state.attributes.event_type == 'double_press' }}"
+action:
+  - service: system_log.write
+    data:
+      message: >
+        counter={{ trigger.to_state.attributes.value }}
+        raw={{ trigger.to_state.attributes.action }}
+```
+
+`value` 就是那个自增计数器，可以用来检测丢包
+（相邻两次事件的 `value` 差了 3，说明中间漏了 2 次）。
+
+---
+
+## 12. Bridge 连通性实体
 
 ```python
 class EspNowBridgeBinary(BinarySensorEntity):
@@ -787,23 +998,113 @@ async_add_entities([EspNowBridgeBinary(hub)])
 
 所以它总是存在，即使一个设备都没有。
 
-### 这是判断整套系统死活的正确实体
+### 12.1 协调器的自述都挂在这个实体的属性上
 
-因为 `SIGNAL_BRIDGE_UPDATED` **只被它订阅**，
-`bridge_online` 变化时只有它会立刻刷新
-（见 [architecture.md §6](architecture.md#6-dispatcher-信号)）。
+`<base>/bridge/info` 是协调器的 hello 行（协议版本、信道、固件、MAC）。
+HA 里没有别的地方能放这些信息，所以它们成了这个实体的
+`extra_state_attributes`：
 
-普通设备实体的 `available` 逻辑上包含了 `bridge_online`，
-但它们要等下一条 `SIGNAL_DEVICE_UPDATED` 才重算——而 Bridge 挂了
-就不会再有状态上报，所以**设备实体可能一直停在"可用"**。
+```python
+@property
+def extra_state_attributes(self) -> dict[str, Any]:
+    info = self._hub.bridge_info
+    attrs: dict[str, Any] = {"base_topic": self._hub.base}
+    for key in ("mac", "fw", "channel", "version", "role", "stack"):
+        if info.get(key) is not None:
+            attrs[key] = info[key]
+    attrs["devices"] = len(self._hub.devices)
+    return attrs
+```
 
-> **写自动化时：监控 `binary_sensor.*_bridge` 从 `on` 变 `off`，
-> 不要监控某个设备实体变 unavailable。** 见
-> [usage.md §4](usage.md#4-推荐的自动化)。
+| 属性 | 来源 | 意思 |
+|---|---|---|
+| `base_topic` | config entry | 这个 entry 用的 MQTT 前缀，多协调器时用来区分 |
+| `mac` | `bridge/info` | 协调器自己的 MAC |
+| `fw` | `bridge/info` | 协调器固件版本 |
+| `channel` | `bridge/info` | ESP-NOW 工作信道 |
+| `version` | `bridge/info` | USB 串行协议版本 |
+| `role` | `bridge/info` | 通常是 `coordinator` |
+| `stack` | `bridge/info` | 底层栈标识 |
+| `devices` | Hub | 当前 `hub.devices` 的条数（含 `slug:` 占位） |
+
+`bridge/info` 没到之前，只有 `base_topic` 和 `devices` 两个属性。
+
+> **0.3.x 里 `bridge/info` 这个主题根本没被订阅。**
+> `hub.bridge_info` 这个字典存在、初始化成 `{}`，然后再也没人写过它。
+> 协调器辛辛苦苦发上来的信道和固件版本，在 HA 里一个字都看不到；
+> 想知道协调器跑在哪个信道上，只能自己 `mosquitto_sub`。
+> 现在 Hub 订阅了它，见
+> [architecture.md §3.4](architecture.md#34-bridgeinfo协调器自述)。
+
+### 12.2 固件版本是事后补写进注册表的
+
+`sw_version` 属于 `DeviceInfo`，而 **`device_info` 只在实体第一次被添加时
+读一次**。这个实体在 `async_setup_entry` 里就建好了，
+比 retained 的 `bridge/info` 到达早得多——
+所以光在 `device_info` 里填 `sw_version` 是不够的，
+设备页上会永远是空的。
+
+```python
+@callback
+def _on_bridge(self, entry_id: str) -> None:
+    if entry_id != self._hub.entry.entry_id:
+        return
+    # This entity is created at setup, long before `bridge/info` arrives, so
+    # the firmware version has to be written to the registry after the fact.
+    info = self._hub.bridge_info
+    async_sync_device_registry(
+        self.hass,
+        "bridge",
+        sw_version=str(info["fw"]) if info.get("fw") else None,
+    )
+    self.async_write_ha_state()
+```
+
+`async_sync_device_registry` 在 `entity.py` 里，会比对再写，
+没变化就不动注册表。普通设备实体的 `model` 走的是同一条路
+（见 [architecture.md §10](architecture.md#10-设备注册表的层级)）。
+
+### 12.3 这是判断整套系统死活的正确实体
+
+`SIGNAL_BRIDGE_UPDATED` 只被这个实体订阅，
+所以 `bridge_online` 变化时只有它会被直接通知。
+但 Hub 在处理 `bridge/state` 时会**额外给每个设备补一发**
+`SIGNAL_DEVICE_UPDATED`：
+
+```python
+@callback
+def _on_bridge_state(self, msg: mqtt.ReceiveMessage) -> None:
+    self.bridge_online = self._text(msg.payload).strip().lower() == "online"
+    async_dispatcher_send(self.hass, SIGNAL_BRIDGE_UPDATED, self.entry.entry_id)
+    # Device entities derive `available` from the bridge too, so they have to
+    # be told as well; otherwise they keep showing a stale value until their
+    # own state topic happens to fire.
+    for mac in list(self.devices):
+        async_dispatcher_send(
+            self.hass, SIGNAL_DEVICE_UPDATED, self.entry.entry_id, mac
+        )
+```
+
+所以协调器掉线时，Bridge 实体变 `off`，
+**所有设备实体同时变 `unavailable`**。
+
+> **0.3.x 里没有那个 for 循环。** `available` 的公式
+> （`bridge_online and device.online`）是对的，但没人在
+> `bridge_online` 变化时叫设备实体重算，
+> 而 `SIGNAL_DEVICE_UPDATED` 只在收到该设备的状态上报时才发——
+> 协调器挂了就永远不会再有状态上报。
+> 结果是**所有设备实体永久停在"可用"，显示着协调器死前的最后一个值**。
+> 这是最坏的一种失效：面板上看一切正常。
+
+即便如此，**写告警自动化还是应该监控
+`binary_sensor.*_bridge` 从 `on` 变 `off`**，而不是某个设备实体变
+unavailable——因为协调器一挂，几十个设备实体会同时变 unavailable，
+逐个监控会推几十条通知。见
+[usage.md §4](usage.md#4-推荐的自动化)。
 
 ---
 
-## 12. 按设备类型看会出什么
+## 13. 按设备类型看会出什么
 
 假设 `caps` 是设备正常上报的值（`en2m` 固件总是报显式 `caps`）。
 每一行都额外有 `Mesh Hop` / `Node Role` / `RSSI` 三个诊断实体，表里省略。
@@ -824,7 +1125,7 @@ async_add_entities([EspNowBridgeBinary(hub)])
 | CO 报警 | `["carbon_monoxide"]` | `binary_sensor.*_carbon_monoxide`（CO） |
 | 气压计 | `["pressure"]` | `sensor.*_pressure` |
 | 光照传感器 | `["illuminance"]` | `sensor.*_illuminance` |
-| 按键 | `["button"]` | **只有诊断实体**（[§1.1](#11-button-cap-不产生任何实体)） |
+| 按键 | `["button"]` | `event.*_button`（[§11](#11-event按钮)） |
 | `router`（中继节点） | 通常没有 caps | 只有诊断实体 |
 
 `router` 节点只出诊断实体是对的——它是纯中继，没有外设。

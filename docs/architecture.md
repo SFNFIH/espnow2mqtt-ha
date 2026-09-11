@@ -1,6 +1,6 @@
 # 集成架构
 
-整个集成 **1447 行 Python，13 个文件**，没有任何第三方依赖
+整个集成 **1786 行 Python，15 个文件**，没有任何第三方依赖
 （`manifest.json` 里 `"requirements": []`）。
 
 它的结构是 HA 自定义集成里最经典的那种：**一个 Hub 持有全部状态，
@@ -11,6 +11,7 @@
 1. [三层分工](#1-三层分工)
 2. [文件职责](#2-文件职责)
 3. [Hub：唯一的状态持有者](#3-hub唯一的状态持有者)
+   - [3.4 `bridge/info`：协调器自述](#34-bridgeinfo协调器自述)
 4. [`EspNowDevice`：设备模型](#4-espnowdevice设备模型)
 5. [Entity 基类与可用性](#5-entity-基类与可用性)
 6. [Dispatcher 信号](#6-dispatcher-信号)
@@ -29,20 +30,21 @@
                       ▼
 ┌──────────────────────────────────────────────┐
 │ hub.py — EspNowHub                           │  ← 唯一持有状态的地方
-│   订阅 4 个主题 → 更新 self.devices          │
+│   订阅 6 个主题 → 更新 self.devices          │
 │   发 dispatcher 信号                         │
 │   提供 async_publish_set / async_permit_join │
 └──────────────────────────────────────────────┘
                       │ SIGNAL_DEVICE_UPDATED(entry_id, mac)
+                      │ SIGNAL_DEVICE_REMOVED(entry_id, mac)
                       │ SIGNAL_BRIDGE_UPDATED(entry_id)
         ┌─────────────┼─────────────┐
         ▼             ▼             ▼
 ┌──────────────┐ ┌──────────┐ ┌──────────────┐
-│ 平台的       │ │ 平台的   │ │ entity.py    │
-│ _discover()  │ │ _discover│ │ EspNowEntity │
-│ 创建实体     │ │ ...      │ │ 刷新状态     │
+│ discovery.py │ │ 各平台的 │ │ entity.py    │
+│ 共用的发现   │ │ _build() │ │ EspNowEntity │
+│ 骨架         │ │ 说要什么 │ │ 刷新/自删    │
 └──────────────┘ └──────────┘ └──────────────┘
-   sensor / binary_sensor / switch / light / fan / cover / lock / climate
+   sensor / binary_sensor / switch / light / fan / cover / lock / climate / event
 ```
 
 三条铁律：
@@ -62,23 +64,29 @@ HA 永远不会主动调用 `update()`。
 
 | 文件 | 行数 | 职责 |
 |---|---:|---|
-| `hub.py` | 294 | **核心**。MQTT 订阅、设备表、caps 推断、状态归一化、发布助手 |
-| `sensor.py` | 173 | 6 个测量量 + 3 个诊断量 |
-| `light.py` | 111 | 亮度/色温，含 0–254↔0–255 和 mired↔Kelvin 换算 |
-| `fan.py` | 106 | 百分比 + 7 个 preset mode |
-| `binary_sensor.py` | 117 | 5 个二元传感器 + **Bridge 连通性实体** |
-| `climate.py` | 100 | 温控器，5 个 HVAC 模式 |
-| `cover.py` | 89 | 窗帘，**含 HA 开度% ↔ 固件关闭% 的反转** |
-| `__init__.py` | 76 | Config entry 装卸、平台转发、`permit_join` 服务 |
-| `config_flow.py` | 69 | UI 配置流 + 选项流（只有一个选项：base topic） |
-| `entity.py` | 61 | `EspNowEntity` 基类：unique_id、device_info、availability、信号订阅 |
-| `lock.py` | 58 | 门锁 |
-| `switch.py` | 57 | 开关（**排除已被识别为灯的设备**） |
-| `const.py` | 17 | 域名、默认主题、主题后缀常量 |
+| `hub.py` | 421 | **核心**。MQTT 订阅、设备表、caps 推断、状态归一化、占位设备合并、发布助手 |
+| `entity.py` | 163 | `EspNowEntity` 基类：unique_id、device_info、availability、属性、信号订阅、**过期自删** |
+| `sensor.py` | 159 | 6 个测量量 + 3 个诊断量 |
+| `binary_sensor.py` | 139 | 5 个二元传感器 + **Bridge 连通性实体** |
+| `light.py` | 116 | 亮度/色温，含 0–254↔0–255 和 mired↔Kelvin 换算 |
+| `climate.py` | 112 | 温控器，5 个 HVAC 模式 |
+| `__init__.py` | 104 | Config entry 装卸、平台转发、`permit_join` 服务、设备移除清理 |
+| `config_flow.py` | 103 | UI 配置流 + 选项流（只有一个选项：base topic） |
+| `event.py` | 100 | 按钮事件（`button` cap） |
+| `cover.py` | 96 | 窗帘，**含 HA 开度% ↔ 固件关闭% 的反转** |
+| `fan.py` | 95 | 百分比 + 7 个 preset mode |
+| `discovery.py` | 58 | 所有平台共用的动态发现骨架（[§7](#7-平台的动态发现模式)） |
+| `lock.py` | 49 | 门锁 |
+| `switch.py` | 48 | 开关（**排除已被识别为灯的设备**） |
+| `const.py` | 23 | 域名、默认主题、主题后缀常量、命令失败事件名 |
 
 `const.py` 里的 `ATTR_MAC` / `ATTR_CAPS` / `ATTR_HOP` / `ATTR_VIA` /
-`ATTR_NODE_ROLE` 五个常量**目前没有任何地方引用**——代码里都是直接用字面量
-字符串。留着无害，但别以为改了它们会有效果。
+`ATTR_NODE_ROLE` 是 `EspNowEntity.extra_state_attributes` 的键名，
+所以每个设备实体都带着自己的 MAC、能力列表和 mesh 拓扑，
+模板里可以直接取（[usage.md §5](usage.md#5-在模板里取值)）。
+
+> 0.3.x 里这五个常量没有任何地方引用，拓扑信息只能从 `sensor.*_mesh_hop`
+> 这类诊断实体绕着拿。
 
 ---
 
@@ -95,19 +103,25 @@ class EspNowHub:
 ```
 
 一个 config entry 一个 Hub，存在 `hass.data[DOMAIN][entry.entry_id]`。
-由于 config flow 限制了**只能有一个 entry**（[§8](#8-config-entry-生命周期)），
-实际上永远只有一个 Hub。
+**可以有多个**：一个协调器一个条目，各自一套主题前缀
+（[§8.5](#85-一个协调器一个-entry)）。
 
-### 3.1 四个 MQTT 订阅
+`self.discovered` 是所有平台共用的"已创建过的 unique_id"集合。
+它放在 Hub 上而不是各平台内部，是为了让一个自删掉的实体
+之后还能被重新创建（[§7](#7-平台的动态发现模式)）。
+
+### 3.1 六个 MQTT 订阅
 
 `async_start()` 里，全部 **QoS 0**：
 
 | 订阅的主题 | 回调 | 干什么 |
 |---|---|---|
-| `<base>/bridge/state` | `_on_bridge_state` | 设 `self.bridge_online`，发 `SIGNAL_BRIDGE_UPDATED` |
-| `<base>/bridge/devices` | `_on_devices` | 遍历数组，更新 name/model/online/node_role/via/hop/rssi |
+| `<base>/bridge/state` | `_on_bridge_state` | 设 `self.bridge_online`，发 `SIGNAL_BRIDGE_UPDATED`，并扇出给所有设备 |
+| `<base>/bridge/info` | `_on_bridge_info` | 存协调器自述（信道、固件、MAC），见 [§3.4](#34-bridgeinfo协调器自述) |
+| `<base>/bridge/devices` | `_on_devices` | 遍历数组，更新 name/model/online/node_role/via/hop/rssi，合并占位设备 |
 | `<base>/+/state` | `_on_device_state` | **最重要的一个**：合并状态、推断 caps、归一化 |
 | `<base>/+/availability` | `_on_availability` | 按 slug 找设备，设 `online` |
+| `<base>/+/command_result` | `_on_command_result` | 命令的成败，失败时抛 HA 事件，见 [usage.md §7](usage.md#7-命令的成败反馈) |
 
 `_unsubs` 存所有退订函数，`async_stop()` 里 pop 光。
 
@@ -139,25 +153,33 @@ HA 的 `mqtt.ReceiveMessage.payload` 在不同版本/不同 encoding 配置下
 可能是 `str` 也可能是 `bytes`，这是防御性写法。`errors="ignore"`
 保证畸形字节不会抛异常。
 
-### 3.4 没有订阅 `bridge/info`
+### 3.4 `bridge/info`：协调器自述
 
-`const.py` 里定义了 `TOPIC_BRIDGE_INFO = "bridge/info"`，
-`hub.py` 里也有 `self.bridge_info: dict[str, Any] = {}`。
+`<base>/bridge/info` 是 retained 的，内容就是协调器上电时那条 `hello` 行
+被 Bridge 原样转发的结果：
 
-> **但集成从来没有订阅这个主题，`bridge_info` 永远是空字典。**
->
-> 后果：集成**拿不到协调器的 ESP-NOW 信道、固件版本、MAC**。
-> 这些信息只存在于 MQTT 上（`<base>/bridge/info`，retained），
-> 要看只能自己订：
->
-> ```bash
-> mosquitto_sub -t espnow2mqtt/bridge/info -C 1 | python3 -m json.tool
-> ```
->
-> 补上这个功能很简单（在 `async_start()` 里加第五个订阅，
-> 回调里 `self.bridge_info = json.loads(raw)`），然后就能给
-> Bridge 那个设备加上 `sw_version` 和信道诊断实体。
-> 当前版本没做。
+```json
+{"type":"hello","version":2,"role":"coordinator",
+ "mac":"AA:BB:CC:DD:EE:FF","fw":"0.4.0-idf",
+ "channel":1,"mesh":true,"stack":"esp-idf"}
+```
+
+Hub 把它存进 `self.bridge_info`，然后有两个去处：
+
+| 去处 | 内容 |
+|---|---|
+| `binary_sensor.esp_now_coordinator_bridge` 的属性 | `mac`、`fw`、`channel`、`version`、`role`、`stack`，再加上 `base_topic` 和当前设备数 |
+| 协调器那个设备条目的 `sw_version` | 就是 `fw` |
+
+> **`sw_version` 要专门写一次。** `device_info` 只在实体**第一次**被加入时读一遍，
+> 而 Bridge 实体是在 `async_setup_entry` 里直接建的，那时
+> `bridge/info` 还没到。所以 `_on_bridge` 回调里会调
+> `async_sync_device_registry()`（`entity.py`），把迟到的固件版本
+> 补写进设备注册表。设备实体的 `model` 同理。
+
+> 0.3.x 里 `TOPIC_BRIDGE_INFO` 这个常量存在、`self.bridge_info` 这个字段也存在，
+> **但从来没有订阅过这个主题**，所以 `bridge_info` 恒为空字典，
+> 协调器的信道和固件版本在 HA 里根本看不到。
 
 ---
 
@@ -276,26 +298,47 @@ class EspNowBridgeBinary(BinarySensorEntity):
 它的 `unique_id` 是 `f"{hub.entry.entry_id}_bridge"`，
 挂在独立的设备 `(DOMAIN, "bridge")` 上。
 
-### 5.3 `_handle_update` 里的指针刷新
+### 5.3 `_handle_update`：过滤、刷新、自删
 
 ```python
+@callback
 def _handle_update(self, entry_id: str, mac: str) -> None:
-    if entry_id != self._hub.entry.entry_id:
+    if entry_id != self._hub.entry.entry_id or mac != self._device.mac:
         return
-    if mac != self._device.mac and mac in self._hub.devices:
-        # 如果 hub 换了对象，刷新指针
-        self._device = self._hub.devices.get(self._device.mac, self._device)
-    if mac == self._device.mac:
-        self.async_write_ha_state()
+    self._device = self._hub.devices.get(mac, self._device)
+    if self._is_stale():
+        self._schedule_purge()
+        return
+    async_sync_device_registry(self.hass, self._device.mac, model=self._device.model)
+    self.async_write_ha_state()
 ```
 
-中间那个分支的意图是"Hub 可能用新对象替换了 `devices[mac]`，实体要重新取指针"。
-实际上 Hub 从不替换对象（`_on_devices` 里 `dev = self.devices.get(mac) or EspNowDevice(mac=mac)`
-是**复用**已有对象的），所以这个分支等价于无操作。留着无害。
+第一行是**最重要的一行**：dispatcher 是广播的，每条 MQTT 消息都会通知
+**所有**实体，这道过滤避免了 N 个设备时的 N² 次状态写入。
 
-真正起作用的是最后两行：**只有信号里的 MAC 是自己的，才刷新 HA 状态。**
-因为 dispatcher 是广播的，每条 MQTT 消息都会通知**所有**实体，
-这道过滤避免了 N 个设备时的 N² 次状态写入。
+`_is_stale()` 判断这个实体赖以存在的那个 cap 还在不在：
+
+```python
+def _is_stale(self) -> bool:
+    # caps 为空表示"还不知道"，不是"什么都不支持"，绝不能据此删实体
+    return bool(
+        self._requires_cap
+        and self._device.caps
+        and self._requires_cap not in self._device.caps
+    )
+```
+
+每个平台的实体类把 `_requires_cap` 设成自己对应的 cap
+（Switch 是 `switch`、Cover 是 `cover`……）；诊断实体
+（hop / rssi / node_role）留空，因为它们对每个 mesh 节点都成立，
+不依赖任何能力。详见 [§7](#7-平台的动态发现模式) 和
+[state-flow.md §6](state-flow.md#6-实体能增也能减)。
+
+> 0.3.x 里这个方法的中间分支条件写反了——写的是
+> `if mac != self._device.mac and mac in self._hub.devices:` 才刷新指针，
+> 也就是**只在信号不是发给自己的时候**才去刷新自己的指针。
+> 因为 Hub 从不替换对象，这个分支实际等价于无操作，所以没造成可见故障，
+> 但它表达的意思和它做的事是两回事。
 
 ---
 
@@ -303,28 +346,33 @@ def _handle_update(self, entry_id: str, mac: str) -> None:
 
 ```python
 SIGNAL_DEVICE_UPDATED = f"{DOMAIN}_device_updated"   # "espnow2mqtt_device_updated"
+SIGNAL_DEVICE_REMOVED = f"{DOMAIN}_device_removed"   # "espnow2mqtt_device_removed"
 SIGNAL_BRIDGE_UPDATED = f"{DOMAIN}_bridge_updated"   # "espnow2mqtt_bridge_updated"
 ```
 
 | 信号 | 参数 | 谁发 | 谁收 |
 |---|---|---|---|
-| `SIGNAL_DEVICE_UPDATED` | `(entry_id, mac)` | `_on_devices`（每个数组元素一次）、`_on_availability`、`_on_device_state` | **每个平台的 `_discover()`**（建实体）+ **每个 `EspNowEntity`**（刷状态） |
-| `SIGNAL_BRIDGE_UPDATED` | `(entry_id,)` | `_on_bridge_state` | 只有 `EspNowBridgeBinary` |
+| `SIGNAL_DEVICE_UPDATED` | `(entry_id, mac)` | `_on_devices`（每个数组元素一次）、`_on_availability`、`_on_device_state`、`_on_bridge_state`（扇出给所有设备） | **每个平台的 `_discover()`**（建实体）+ **每个 `EspNowEntity`**（刷状态或自删） |
+| `SIGNAL_DEVICE_REMOVED` | `(entry_id, mac)` | `_absorb_placeholder` | `EspNowEntity`（自删）+ `__init__.py` 的 `_device_removed`（删设备条目、清 `hub.discovered`） |
+| `SIGNAL_BRIDGE_UPDATED` | `(entry_id,)` | `_on_bridge_state`、`_on_bridge_info` | 只有 `EspNowBridgeBinary` |
 
-注意 `SIGNAL_BRIDGE_UPDATED` **只被 Bridge 实体订阅**。
-所以 `bridge_online` 变化时，普通设备实体的 `available` 虽然逻辑上变了，
-但**不会立刻刷新** ——要等下一条 `SIGNAL_DEVICE_UPDATED`
-（也就是下一次状态上报，最多 30 秒）才会重算。
+`SIGNAL_BRIDGE_UPDATED` 仍然只被 Bridge 实体订阅，但这不再是问题：
+`_on_bridge_state` 在发完这个信号之后，会**再对每个已知 MAC 发一遍
+`SIGNAL_DEVICE_UPDATED`**，所以 Bridge 一掉线，所有设备实体立刻重算
+`available` 并变灰。
 
-> **实际表现**：Bridge 挂掉后，HA 里的设备实体不会立刻变灰，
-> 而是等 Bridge 的 LWT 生效 + 下一次…… 但 Bridge 挂了就不会再有
-> 状态上报了，所以**实体可能一直停在"可用"状态直到 HA 重启**。
->
-> 只有"Bridge"那个连通性实体会立刻变成 off。
-> 所以**判断整套系统死活要看 `binary_sensor.*_bridge`，不要看设备实体是否变灰**。
->
-> 修法是在 `_on_bridge_state` 里除了发 `SIGNAL_BRIDGE_UPDATED`，
-> 再对每个已知 MAC 发一遍 `SIGNAL_DEVICE_UPDATED`。当前版本没做。
+```python
+@callback
+def _on_bridge_state(self, msg):
+    self.bridge_online = self._text(msg.payload).strip().lower() == "online"
+    async_dispatcher_send(self.hass, SIGNAL_BRIDGE_UPDATED, self.entry.entry_id)
+    for mac in list(self.devices):
+        async_dispatcher_send(self.hass, SIGNAL_DEVICE_UPDATED, self.entry.entry_id, mac)
+```
+
+> 0.3.x 里没有这个扇出。因为 Bridge 挂了就不会再有状态上报，
+> 设备实体拿不到任何 `SIGNAL_DEVICE_UPDATED`，于是**一直停在"可用"状态
+> 直到 HA 重启**——只有 `binary_sensor.*_bridge` 会变成 off。
 
 `async_dispatcher_send` 是同步派发（在 HA 的事件循环上直接调用所有回调），
 所以一条 MQTT 消息的处理是原子的，没有并发问题。这也是为什么
@@ -340,20 +388,36 @@ Hub 里**一把锁都没有**——不像 Bridge 那边有多线程问题
 ```python
 async def async_setup_entry(hass, entry, async_add_entities):
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
 
+    def _build(hub, device) -> list[Entity]:
+        if "<cap>" not in device.caps:
+            return []
+        return [EspNow<X>(hub, device)]
+
+    async_setup_device_discovery(hass, entry, hub, async_add_entities, _build)
+```
+
+每个平台只剩一个 `_build()`，说清"给这个设备，我要哪些实体"。
+其余的全在 `discovery.py` 里：
+
+```python
+@callback
+def async_setup_device_discovery(hass, entry, hub, async_add_entities, build):
     @callback
     def _discover(entry_id: str, mac: str) -> None:
         if entry_id != entry.entry_id:
             return
-        dev = hub.devices.get(mac)
-        if not dev or "<cap>" not in dev.caps:
+        device = hub.devices.get(mac)
+        if device is None:
             return
-        uid = f"{mac}_<cap>"
-        if uid in known:
+        fresh = [
+            entity for entity in build(hub, device)
+            if entity.unique_id and entity.unique_id not in hub.discovered
+        ]
+        if not fresh:
             return
-        known.add(uid)
-        async_add_entities([EspNow<X>(hub, dev)])
+        hub.discovered.update(entity.unique_id for entity in fresh)
+        async_add_entities(fresh)
 
     entry.async_on_unload(
         async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
@@ -362,24 +426,29 @@ async def async_setup_entry(hass, entry, async_add_entities):
         _discover(entry.entry_id, mac)
 ```
 
-三个要点：
+四个要点：
 
 | 要点 | 说明 |
 |---|---|
-| **`known` 是闭包里的 set** | 它防止重复创建。**不在 Hub 里，也不持久化** —— HA 重启后重新开始，靠 `unique_id` 让 HA 的实体注册表去重 |
+| **`hub.discovered` 在 Hub 上，不在各平台闭包里** | 这是关键。实体自删的时候会 `hub.discovered.discard(uid)`，于是同一个 uid 之后**还能再被创建**。0.3.x 里这个集合是每个平台的局部 `known`，实体删掉了也没法通知它，所以 cap 回来了实体也回不来 |
+| **`build()` 必须无副作用** | 它在每次更新时都被调用，返回的实体如果 uid 已存在就直接丢掉，根本不会进 hass。所以实体的 `__init__` 里不能做有副作用的事——这也是灯的色彩模式必须做成动态属性而不能在 `__init__` 里定死的原因之一 |
 | **先注册信号，再扫一遍现有设备** | 顺序很重要：如果先扫再注册，扫描和注册之间到达的消息会丢 |
 | **`entry.async_on_unload`** | 卸载 entry 时自动退订，不会泄漏回调 |
 
-`_discover` 会在**每一条 MQTT 消息**上被调用（七个平台各一次），
-大部分时候立刻因为 `uid in known` 返回。这个开销可以忽略。
+`_discover` 会在**每一条 MQTT 消息**上被调用（八个平台各一次），
+大部分时候 `build()` 立刻返回空表或者返回的 uid 全都已存在。
+这个开销可以忽略。
+
+因为 uid 的形式是 `f"{mac}_{key}"` 而各平台的 `key` 互不相同，
+共用一个集合不会撞车。
 
 条件的差异见 [entities.md](entities.md#1-caps--平台映射)。
 只有两个平台不是简单的 `"<cap>" in caps`：
 
 - `switch.py`：`"switch" in caps and "light" not in caps`
   （被识别成灯的设备不再出 Switch 实体）
-- `sensor.py`：`wanted = set(dev.caps) | {"hop", "node_role"}`，
-  外加 rssi，然后对测量类 key 再要求它真的在 caps 里
+- `sensor.py`：诊断量 `hop` / `node_role` 无条件要，`rssi` 在有值时要，
+  测量量则要求它真的在 caps 里
 
 ---
 
@@ -432,7 +501,9 @@ async def _permit_join(call: ServiceCall) -> None:
             await h.async_permit_join(duration)
 ```
 
-实际上只有一个 Hub，这个循环是防御性的。
+配了多个协调器时，这个循环会**同时打开所有协调器的配对窗口**。
+想只开一个的话直接往那个前缀发 MQTT：
+`mosquitto_pub -t espnow2mqtt_upstairs/bridge/request/permit_join -m 60`。
 
 ### 8.3 选项变更 → 重载
 
@@ -468,39 +539,50 @@ async def async_unload_entry(hass, entry) -> bool:
 先卸平台（实体退订 dispatcher），再退 MQTT 订阅。
 最后一个 Hub 走的时候才注销服务并清掉 `hass.data[DOMAIN]`。
 
-### 8.5 只允许一个 entry
+### 8.5 一个协调器一个 entry
 
 `config_flow.py`：
 
 ```python
 async def async_step_user(self, user_input=None):
-    if self._async_current_entries():
-        return self.async_abort(reason="already_configured")
-    if mqtt.DOMAIN not in self.hass.config.components:
+    if not _mqtt_is_ready(self.hass):
         return self.async_abort(reason="mqtt_not_ready")
-    ...
-    await self.async_set_unique_id(DOMAIN)
-    self._abort_if_unique_id_configured()
+    if user_input is not None:
+        base = _clean(user_input.get(CONF_BASE_TOPIC))
+        await self.async_set_unique_id(f"{DOMAIN}:{base}")
+        self._abort_if_unique_id_configured()
+        ...
 ```
 
 两道 abort：
 
 | reason | 何时 | 提示文本（`strings.json`） |
 |---|---|---|
-| `already_configured` | 已经有一个 entry | "ESP-NOW 2 MQTT is already configured" |
+| `already_configured` | **这个主题前缀上**已经有一个 entry | "A coordinator is already configured on this base topic" |
 | `mqtt_not_ready` | HA 里还没配 MQTT 集成 | "MQTT integration is not set up. Add MQTT first." |
 
-`unique_id` 被设成域名本身，加上 `_async_current_entries()` 检查，
-**双重保证只有一个 entry**。
+`unique_id` 是 `f"{DOMAIN}:{base}"`，所以**限制的是主题前缀而不是条目数量**。
+两个协调器各用自己的前缀就能同时接进来（[usage.md §11](usage.md#11-多个协调器)）。
+选项流改前缀时也会查一遍别的条目有没有占用，占了就在表单上报错而不是静默重复。
 
-> **所以一个 HA 实例只能接一个 Bridge。** 想接两个协调器
-> （比如两个楼层各一个），当前版本做不到——即使它们用不同的 base topic。
-> 要支持得去掉 `_async_current_entries()` 检查并把 `unique_id` 改成
-> base topic。`hass.data[DOMAIN]` 已经是按 `entry_id` 索引的，
-> Hub 层面本来就支持多实例。
+`_mqtt_is_ready()` 查的是**有没有一个已加载的 MQTT config entry**：
+
+```python
+def _mqtt_is_ready(hass: HomeAssistant) -> bool:
+    return any(
+        entry.state is ConfigEntryState.LOADED
+        for entry in hass.config_entries.async_entries(mqtt.DOMAIN)
+    )
+```
+
+> 0.3.x 查的是 `mqtt.DOMAIN not in self.hass.config.components`，
+> 这个判断**永远不成立**：`manifest.json` 的 `dependencies` 里写了 `mqtt`，
+> HA 一开始这个流程就会把 `mqtt` 作为依赖加载上，于是 `components` 里必然有它。
+> 也就是说那个 abort 分支不可达，没配 broker 的人会一路走到表单，
+> 建出一个永远收不到消息的条目。
 
 配置项只有一个：**base topic**。默认 `espnow2mqtt`，
-输入时会 `.strip().rstrip("/")`。
+输入时会 `.strip().strip("/")`，空串回落到默认值。
 
 ---
 
@@ -576,22 +658,28 @@ if ":" in dev.mac and not dev.mac.startswith("slug:"):
 `slug:` 前缀的判断是为了排除占位设备（见
 [state-flow.md §3.3](state-flow.md#33-slug-占位设备)）。
 给占位设备加 `("mac", "slug:relay1")` 这种连接会污染 HA 的设备注册表，
-甚至可能和别的集成的设备意外合并。
+甚至可能和别的集成的设备意外合并。占位设备被合并掉时，
+`__init__.py` 的 `_device_removed` 会把它的设备条目也从注册表里摘掉，
+所以那一栏不会留下一个空壳设备。
 
 Bridge 那个设备是由 `EspNowBridgeBinary` 单独声明的：
 
 ```python
+info = self._hub.bridge_info
 DeviceInfo(
     identifiers={(DOMAIN, "bridge")},
     name="ESP-NOW Coordinator",
     manufacturer="espnow2mqtt",
     model="USB Coordinator Bridge",
+    sw_version=str(info["fw"]) if info.get("fw") else None,
+    connections={("mac", str(info["mac"]).lower())} if ... else None,
 )
 ```
 
-**注意它没有 `sw_version`**——因为 `bridge_info` 从未被填充
-（[§3.4](#34-没有订阅-bridgeinfo)）。补上那个订阅之后就可以把
-协调器的固件版本和信道显示在这里。
+`sw_version` 和 `connections` 都来自 `bridge/info`
+（[§3.4](#34-bridgeinfo协调器自述)）。因为这个实体在 `bridge/info` 到达
+之前就建好了，`device_info` 那一遍读到的是空的，所以 `_on_bridge` 回调里
+还会再调一次 `async_sync_device_registry()` 把固件版本补写进去。
 
 ---
 

@@ -11,12 +11,13 @@
 2. [`permit_join` 服务](#2-permit_join-服务)
 3. [控制设备](#3-控制设备)
 4. [推荐的自动化](#4-推荐的自动化)
-5. [模板取值](#5-模板取值)
+5. [在模板里取值](#5-在模板里取值)
 6. [绕过集成直接用 MQTT](#6-绕过集成直接用-mqtt)
-7. [命令是单向的](#7-命令是单向的)
+7. [命令的成败反馈](#7-命令的成败反馈)
 8. [改设备名](#8-改设备名)
-9. [移除设备](#9-移除设备)
+9. [彻底删掉一个设备](#9-彻底删掉一个设备)
 10. [能源面板](#10-能源面板)
+11. [多个协调器](#11-多个协调器)
 
 ---
 
@@ -36,14 +37,20 @@
 退订旧主题、丢掉整个内存设备表、用新前缀重新订阅。
 实体会短暂不可用，然后随着新前缀下的 retained 消息重新填充。
 
-> **只能添加一个集成实例。** config flow 里有
-> `_async_current_entries()` 检查和 `unique_id = DOMAIN`，
-> 双重保证。所以一个 HA 实例接不了两个协调器。
-> 原因和改法见 [architecture.md §8.5](architecture.md#85-只允许一个-entry)。
+> **一个 base topic 只能有一个 entry，但可以有多个 entry。**
+> `unique_id` 是 `f"{DOMAIN}:{base}"`，所以重复添加同一个前缀会
+> `already_configured`，而换个前缀就能再加一个协调器。
+> 见 [§11](#11-多个协调器)。
+>
+> **0.3.x 里**`unique_id` 是写死的 `DOMAIN`，
+> 一个 HA 实例**只能接一个协调器**。
 
 添加集成时如果 HA 里还没配 MQTT，会直接 abort 并提示
 "MQTT integration is not set up. Add MQTT first."
-（`mqtt_not_ready`）。
+（`mqtt_not_ready`）。判定条件是"存在一个已经 LOADED 的 mqtt config
+entry"，而不是 `mqtt` 这个组件有没有被 import——
+后者因为 `manifest.json` 里声明了 `dependencies: ["mqtt"]` 而恒为真，
+见 [architecture.md §8.5](architecture.md#85-一个协调器一个-entry)。
 
 ---
 
@@ -184,9 +191,9 @@ data:
 
 ### 4.1 监控 Bridge 掉线
 
-**这是最该做的一条。** 因为 Bridge 挂掉时**设备实体不会立刻变灰**
-（见 [entities.md §11](entities.md#11-bridge-连通性实体)），
-只有 Bridge 那个连通性实体会立刻变成 off。
+**这是最该做的一条。** 协调器一挂，所有设备实体会同时变 unavailable
+（见 [entities.md §12.3](entities.md#123-这是判断整套系统死活的正确实体)），
+所以**告警要挂在这一个实体上**，不然几十个设备会各推一条通知。
 
 ```yaml
 automation:
@@ -285,12 +292,65 @@ automation:
 跳数从 1 变 2 意味着设备改挂到了一个 router 下面，
 通常是直连信号变差了。
 
+### 4.5 按键触发
+
+按键是 `event` 实体，触发方式和别的实体不一样：
+**监听它的状态变化，然后按 `event_type` 属性分支**。
+`event` 实体的"状态"是事件发生的时间戳，所以每次按键都是一次
+状态变化，不会被 HA 的去重吃掉。
+
+```yaml
+automation:
+  - alias: 门铃按钮
+    triggers:
+      - trigger: state
+        entity_id: event.doorbell_button
+    conditions:
+      # 过滤掉 HA 重启时的 unknown -> 时间戳
+      - condition: template
+        value_template: "{{ trigger.from_state.state not in ['unknown','unavailable'] }}"
+    actions:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.to_state.attributes.event_type == 'press' }}"
+            sequence:
+              - action: light.toggle
+                target: {entity_id: light.hallway}
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.to_state.attributes.event_type == 'double_press' }}"
+            sequence:
+              - action: scene.turn_on
+                target: {entity_id: scene.all_off}
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.to_state.attributes.event_type == 'long_press' }}"
+            sequence:
+              - action: notify.persistent_notification
+                data: {message: 门铃被长按}
+```
+
+四种 `event_type`：`press`、`double_press`、`long_press`、`release`。
+固件报的原话在 `attributes.action` 里，自增计数器在
+`attributes.value` 里。换算规则和"为什么固件必须报计数器"见
+[entities.md §11](entities.md#11-event按钮)。
+
+> **0.3.x 里这件事只能绕开集成做**，用 `platform: mqtt` 直接订阅
+> `espnow2mqtt/<slug>/state`——因为 `button` cap 不产生任何实体。
+> 那种写法还有个隐患：`<slug>/state` 是 retained 的，
+> HA 每次重启都会收到最后一条，于是**重启就响一次门铃**。
+
+### 4.6 命令没送到时告警
+
+见 [§7](#7-命令的成败反馈)。
+
 ---
 
-## 5. 模板取值
+## 5. 在模板里取值
 
-集成**不暴露 `hop` / `via` / `caps` 作为实体属性**——
-所有信息都在独立的实体里。
+大部分信息都有独立的实体（诊断量），另外每个设备实体身上
+还挂了一组 `espnow2mqtt_*` 属性。
 
 | 想要什么 | 怎么取 |
 |---|---|
@@ -299,40 +359,54 @@ automation:
 | RSSI | `states('sensor.bedroom_sensor_rssi')` |
 | Bridge 在线 | `is_state('binary_sensor.esp_now_coordinator_bridge','on')` |
 | 灯的亮度（HA 0–255） | `state_attr('light.living_room_light','brightness')` |
-| 窗帘开度（HA 0–100） | `state_attr('cover.bedroom_cover','current_cover_position')` |
+| 窗帘开度（HA 0–100） | `state_attr('cover.bedroom_cover','current_position')` |
+| 协调器信道 | `state_attr('binary_sensor.esp_now_coordinator_bridge','channel')` |
+| 协调器固件 | `state_attr('binary_sensor.esp_now_coordinator_bridge','fw')` |
+| 设备总数 | `state_attr('binary_sensor.esp_now_coordinator_bridge','devices')` |
 
-### 5.1 `via`（上一跳）拿不到
+### 5.1 每个设备实体都带 `espnow2mqtt_*` 属性
 
-`EspNowDevice.via` 在 Hub 里维护着，但**没有任何实体暴露它**。
-要看只能直接读 MQTT：
+`EspNowEntity.extra_state_attributes` 在**每一个**设备实体上
+（light / switch / sensor / …，不含 Bridge 那个）都放了这些：
 
-```yaml
-mqtt:
-  - sensor:
-      name: "Bedroom Sensor Via"
-      state_topic: "espnow2mqtt/bedroom_sensor/state"
-      value_template: "{{ value_json.via | default('unknown') }}"
-      entity_category: diagnostic
+| 属性 | 什么时候有 | 内容 |
+|---|---|---|
+| `espnow2mqtt_mac` | 总是 | 设备 MAC；`slug:` 占位设备是 `None` |
+| `espnow2mqtt_caps` | 总是 | 当前能力列表，可能是 `[]`（还没上报过） |
+| `espnow2mqtt_hop` | `hop` 已知 | 跳数 |
+| `espnow2mqtt_via` | `via` 已知 | **上一跳的 MAC** |
+| `espnow2mqtt_node_role` | `node_role` 已知 | `leaf` / `router` |
+
+所以上一跳直接这么取：
+
+```jinja
+{{ state_attr('switch.living_room_switch', 'espnow2mqtt_via') }}
 ```
 
-同理，**协调器的信道和固件版本**也拿不到（`bridge_info` 从未被填充，
-见 [architecture.md §3.4](architecture.md#34-没有订阅-bridgeinfo)）：
+列出所有经由某个 router 中继的设备：
 
 ```yaml
-mqtt:
+template:
   - sensor:
-      name: "ESP-NOW Channel"
-      state_topic: "espnow2mqtt/bridge/info"
-      value_template: "{{ value_json.channel }}"
-      entity_category: diagnostic
-  - sensor:
-      name: "ESP-NOW Coordinator FW"
-      state_topic: "espnow2mqtt/bridge/info"
-      value_template: "{{ value_json.fw }}"
-      entity_category: diagnostic
+      - name: "经由 Router A 的设备"
+        state: >
+          {{ states.switch
+             | selectattr('attributes.espnow2mqtt_via','defined')
+             | selectattr('attributes.espnow2mqtt_via','eq','AA:BB:CC:00:11:22')
+             | map(attribute='name') | list | join(', ') }}
 ```
 
-这两个主题都是 retained 的，所以 HA 重启后立刻有值。
+看一个设备被推断出了哪些能力（排查"实体没出来"时很有用）：
+
+```jinja
+{{ state_attr('sensor.bedroom_sensor_temperature', 'espnow2mqtt_caps') }}
+```
+
+> **0.3.x 里这五个常量在 `const.py` 里定义好了，但没有任何代码用它们。**
+> `hop` / `node_role` / `rssi` 有独立的诊断实体，
+> 而 `via` 和 `caps` 在 HA 里**完全看不到**——
+> 想知道上一跳只能自己配一个 `platform: mqtt` 的 sensor 去解
+> `value_json.via`。
 
 ### 5.2 统计在线设备数
 
@@ -348,7 +422,7 @@ template:
 ```
 
 用 `Mesh Hop` 这个诊断实体来数，因为**每个设备都必然有一个**
-（见 [entities.md §1.3](entities.md#13-诊断实体总是有)）。
+（见 [entities.md §1.3](entities.md#12-诊断实体总是有)）。
 
 更直接的办法是读 `bridge/devices`：
 
@@ -383,27 +457,36 @@ mqtt:
 
 ## 6. 绕过集成直接用 MQTT
 
-集成有几个缺口需要直接用 MQTT 补：
+0.4.0 之后需要绕开集成的事情只剩三件：
 
 | 想做什么 | 为什么集成做不到 |
 |---|---|
-| 按键事件 | `button` cap 不产生实体（[entities.md §1.1](entities.md#11-button-cap-不产生任何实体)） |
-| 协调器信道 / 固件版本 | `bridge_info` 从未被填充 |
-| 设备的 `via` | 没有实体暴露它 |
-| 移除设备（`unpair`） | Bridge 没有暴露 MQTT 入口 |
+| 移除设备（`unpair`） | Bridge 没有暴露 MQTT 入口，只能往串口发（[§9](#9-彻底删掉一个设备)） |
 | 发 fire-and-forget 命令 | 集成总是让 Bridge 带 ACK/重传 |
+| cluster 风格的命令（指定端点） | 集成只发扁平 payload（[§6.2](#62-手工发命令)） |
+
+> **0.3.x 里这个表还有三行：按键事件、协调器信道/固件版本、设备的 `via`。**
+> 现在分别有了 `event` 实体（[entities.md §11](entities.md#11-event按钮)）、
+> Bridge 实体的属性（[entities.md §12.1](entities.md#121-协调器的自述都挂在这个实体的属性上)）、
+> 和 `espnow2mqtt_via` 属性（[§5.1](#51-每个设备实体都带-espnow2mqtt_-属性)）。
+> 如果你照着旧文档配过那几个 `platform: mqtt` sensor，
+> **现在可以删掉了**，留着只是重复。
 
 ### 6.1 读原始状态
 
 ```yaml
 mqtt:
   - sensor:
-      name: "Doorbell Button"
+      name: "Doorbell Raw"
       state_topic: "espnow2mqtt/doorbell/state"
       value_template: "{{ value_json.button | default('none') }}"
 ```
 
 `<slug>/state` 是 retained 的，所以这个 sensor 重启后立刻有值。
+
+> 这个例子只用来看原始 payload。**真要做门铃自动化请用
+> `event.doorbell_button`**——上面这个 sensor 因为主题是 retained 的，
+> HA 每次重启都会重新收到最后一次按键，用它做触发会误触发。
 
 `<slug>/<key>` 这些扁平主题**不 retain**，而且值是 Python 的 `str()`
 （`True` 不是 `true`，列表是 `['a']` 不是 `["a"]`）——
@@ -472,28 +555,130 @@ data:
 
 ---
 
-## 7. 命令是单向的
+## 7. 命令的成败反馈
 
-**集成发出命令后不等任何确认。** `<slug>/set` 是单向的，
-MQTT 上没有 `last_error` 之类的反馈主题。
+`<slug>/set` 本身是 fire-and-forget 的：集成 publish 完就返回，
+服务调用不会阻塞、也不会抛异常。
+但命令的**结局**会沿着反方向走回来。
 
-完整链路里的失败会在 Bridge 的日志里出现：
+### 7.1 反馈链路
+
+协调器对每条下行命令都会回一个 ack（成功，或者重传耗尽后的
+`timeout` / `send_fail`）。Bridge 收到 ack 后把它重新发布到
+**`<base>/<slug>/command_result`**（非 retained），
+Hub 订阅这个主题，成功的只记一条 debug 日志，
+失败的则在 HA 的事件总线上 fire 一个 **`espnow2mqtt_command_failed`**。
 
 ```
-WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
-WARNING espnow2mqtt: command 8 to AA:BB:CC:DD:EE:FF failed: send_fail
+light.turn_on
+  → espnow2mqtt/living_room/set   {"switch":"ON"}
+  → USB  {"type":"cmd","id":7,...}
+  → ESP-NOW（最多 4 次发送，1.6 s 窗口）
+  ← USB  {"type":"ack","id":7,"ok":false,"error":"timeout"}
+  ← espnow2mqtt/living_room/command_result
+         {"id":7,"ok":false,"mac":"AA:...","error":"timeout",
+          "payload":{"switch":"ON"},"elapsed_ms":1642}
+  ← HA 事件总线：espnow2mqtt_command_failed
 ```
 
-但**这些都不会到 MQTT，所以 HA 完全不知道**。
+`command_result` 的字段：
 
-| HA 里的表现 | 可能的原因 |
+| 字段 | 总是有 | 内容 |
+|---|---|---|
+| `id` | ✓ | 命令序号，和 Bridge 日志里的那个是同一个 |
+| `ok` | ✓ | `true` / `false` |
+| `mac` | ✓ | 目标 MAC，认不出来时是 `null` |
+| `error` | 失败时 | `timeout` / `send_fail` / … |
+| `payload` | Bridge 还记得这条命令时 | **原始命令内容**，用来判断是哪个操作失败了 |
+| `elapsed_ms` | 同上 | 从 publish 到 ack 的耗时 |
+
+`payload` 和 `elapsed_ms` 来自 Bridge 的 `pending` 表。
+那个表有 30 秒 TTL（`PENDING_TTL_S`），所以协调器中途重启、
+ack 迟到太久的话这两个字段会缺失，但 `id` / `ok` / `error` 还在。
+
+### 7.2 `espnow2mqtt_command_failed` 事件
+
+事件数据：
+
+| 键 | 内容 |
 |---|---|
-| 实体状态不变 | 命令超时（设备断电/信号差）；或者设备收到了但**拒绝**了那个值 |
-| 实体状态短暂变了又回去 | HA 前端的乐观更新，真实状态上报回来后被纠正 |
+| `entry_id` | 哪个 config entry（多协调器时用得上） |
+| `slug` | 设备的 MQTT slug |
+| `mac` | 设备 MAC，占位设备或认不出来时是 `None` |
+| `name` | 设备名（固件报的那个），可能是 `""` |
+| `id` | 命令序号 |
+| `error` | `timeout` / `send_fail` / … |
+| `payload` | 原始命令内容，可能是 `None` |
 
-### 怎么察觉命令失败
+**只有失败才会 fire。** 成功的命令不产生事件——
+否则一个正常的家庭每天会有几千个事件塞满 logbook。
 
-**在自动化里加"验证 + 重试"**：
+一条通用的告警自动化：
+
+```yaml
+automation:
+  - alias: ESP-NOW 命令失败告警
+    triggers:
+      - trigger: event
+        event_type: espnow2mqtt_command_failed
+    actions:
+      - action: notify.persistent_notification
+        data:
+          title: ESP-NOW 命令没送到
+          message: >
+            {{ trigger.event.data.name or trigger.event.data.slug }}
+            未响应命令 #{{ trigger.event.data.id }}
+            （{{ trigger.event.data.error }}）。
+            内容：{{ trigger.event.data.payload }}
+```
+
+按错误类型分开处理：
+
+```yaml
+automation:
+  - alias: ESP-NOW 重试超时的命令
+    triggers:
+      - trigger: event
+        event_type: espnow2mqtt_command_failed
+        event_data:
+          error: timeout
+    actions:
+      # 只重试一次，而且只重试开关类命令
+      - condition: template
+        value_template: "{{ 'switch' in (trigger.event.data.payload or {}) }}"
+      - action: mqtt.publish
+        data:
+          topic: "espnow2mqtt/{{ trigger.event.data.slug }}/set"
+          payload: "{{ trigger.event.data.payload | to_json }}"
+```
+
+> **⚠️ 自动重试要小心。** `timeout` 的常见原因是设备断电或者
+> 信号太差，这两种情况重试也不会成功，只会让 ESP-NOW 信道更忙。
+> 上面那条自动化没有次数上限，真要用得加一个 `input_number` 计数器。
+> 更稳的做法是**只告警不重试**。
+
+> **0.3.x 里协调器的 ack 到了 Bridge 就停下了**，只写一行日志：
+>
+> ```
+> WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
+> ```
+>
+> MQTT 上没有任何反馈主题，HA 完全不知道命令失败过。
+> 唯一能察觉的办法是"发完等 5 秒，看实体状态变没变"（见 §7.3），
+> 而这个办法对没有可读状态的命令（比如 `identify`）完全无效。
+
+### 7.3 事件不能完全替代状态校验
+
+`command_result` 说的是**"协调器把帧送到了设备并收到了链路层 ACK"**，
+不是"设备照办了"。这两件事有区别：
+
+| HA 里的表现 | `command_result` | 原因 |
+|---|---|---|
+| 状态不变 | `ok: false` | 命令根本没送到（断电 / 信号差） |
+| 状态不变 | **`ok: true`** | 送到了，但设备**拒绝**了那个值（超出范围、cluster 没注册 identify 回调…） |
+| 状态短暂变了又回去 | `ok: true` | HA 前端的乐观更新，被真实上报纠正 |
+
+第二行是事件抓不到的。所以关键操作还是要校验状态：
 
 ```yaml
 automation:
@@ -505,34 +690,22 @@ automation:
     actions:
       - action: light.turn_on
         target: {entity_id: light.living_room_light}
-      - delay: "00:00:05"
+      - wait_template: "{{ is_state('light.living_room_light','on') }}"
+        timeout: "00:00:05"
+        continue_on_timeout: true
       - if:
           - condition: state
             entity_id: light.living_room_light
             state: "off"
         then:
-          - action: light.turn_on
-            target: {entity_id: light.living_room_light}
-          - delay: "00:00:05"
-          - if:
-              - condition: state
-                entity_id: light.living_room_light
-                state: "off"
-            then:
-              - action: notify.persistent_notification
-                data:
-                  message: 客厅灯两次都没开成，检查设备
+          - action: notify.persistent_notification
+            data:
+              message: 客厅灯没开成，检查设备
 ```
 
-5 秒的延迟是有余量的：S3 侧的 ACK/重传窗口是 1.6 秒
-（4 次发送 + 超时），加上设备上报和 MQTT 的往返，
-正常情况 1 秒内状态就回来了。
-
-### 要真正的失败反馈得改代码
-
-Bridge 的 `_on_ack` 里加一次 publish（比如到
-`<base>/<slug>/last_error`），集成再订阅它。两边都要改。
-当前版本没有。
+`wait_template` 比固定 `delay` 好：正常情况下 1 秒内状态就回来了，
+不用干等 5 秒。5 秒的上限是有余量的——S3 侧的 ACK/重传窗口是
+1.6 秒（4 次发送 + 超时），加上设备上报和 MQTT 的往返。
 
 ---
 
@@ -579,7 +752,7 @@ config 主题会让 HA 里多出一套永远不可用的实体**，那就必须�
 
 ---
 
-## 9. 移除设备
+## 9. 彻底删掉一个设备
 
 要完整移除一个设备，四步都得做。**少做一步它就会回来。**
 
@@ -644,6 +817,42 @@ sudo systemctl start espnow2mqtt
 > 设备就又回来了——因为集成是按 MQTT 上的内容重建设备表的，
 > 它根本不知道你在 HA 里删过。
 
+### 集成自己会删的那一种
+
+有一种删除是自动的，和上面四步无关：**`slug:` 占位设备被合并掉时**。
+
+设备的 retained `<slug>/state` 先到、`bridge/devices` 后到的情况下，
+Hub 会先建一个 `slug:<name>` 的临时设备，等真 MAC 到了再把状态搬过去、
+然后发 `SIGNAL_DEVICE_REMOVED` 把占位的删掉：
+
+```python
+@callback
+def _device_removed(entry_id: str, mac: str) -> None:
+    if entry_id != entry.entry_id:
+        return
+    hub.discovered = {
+        uid for uid in hub.discovered if not uid.startswith(f"{mac}_")
+    }
+    registry = dr.async_get(hass)
+    device = registry.async_get_device(identifiers={(DOMAIN, mac)})
+    if device and entry.entry_id in device.config_entries:
+        registry.async_update_device(
+            device.id, remove_config_entry_id=entry.entry_id
+        )
+```
+
+删设备注册表条目会连带删掉它下面的所有实体，这正是想要的——
+占位设备下的每个实体的 `unique_id` 都是
+`slug:xxx_<key>` 这种没法用的形式。
+
+> **0.3.x 里这个合并根本不发生。** 占位设备和真设备会**同时存在**，
+> 同一个物理设备在 HA 里出现两次：一个有完整状态但 MAC 显示不出来，
+> 一个有 MAC 但状态是空的。只能手工删，而且删完下次 HA 重启还会再来一遍。
+> 详见 [state-flow.md §3.3](state-flow.md#33-slug-占位设备)。
+
+另一种自动删除是**能力消失时实体自删**（不是删设备），
+见 [state-flow.md §6](state-flow.md#6-实体能增也能减)。
+
 ---
 
 ## 10. 能源面板
@@ -672,6 +881,103 @@ sudo systemctl start espnow2mqtt
 但如果你把上报间隔调得很长（比如 5 分钟省电），
 能源曲线会变得很粗糙。调参见
 [device 仓库 docs/kconfig.md](https://github.com/SFNFIH/espnow2mqtt-device/blob/main/docs/kconfig.md)。
+
+---
+
+## 11. 多个协调器
+
+一个 ESP-NOW 网络最多 32 个 peer，而且所有节点必须在同一个 Wi-Fi 信道上。
+超出这个规模、或者想把两栋楼/两个楼层分开，就要跑第二个协调器。
+
+**每个协调器 = 一个 Bridge 进程 + 一个独立的 base topic + 一个 config entry。**
+
+### 11.1 配起来
+
+1. 第二个 S3 烧同样的协调器固件，**信道设成不同的**
+   （同信道的两个协调器会互相干扰配网）
+2. 第二个 Bridge 进程指向不同的串口和不同的前缀：
+
+```bash
+espnow2mqtt --port /dev/ttyACM1 \
+            --base-topic espnow2mqtt_upstairs \
+            --state-file /var/lib/espnow2mqtt/devices-upstairs.json
+```
+
+**`--state-file` 一定要分开**，两个进程共用一个会互相覆盖。
+
+3. HA 里再添加一次集成，base topic 填 `espnow2mqtt_upstairs`
+
+`unique_id` 是 `f"{DOMAIN}:{base}"`，所以只要前缀不同就能加进去；
+前缀相同会 `already_configured`。选项流里也做了同样的检查：
+把 entry A 的前缀改成 entry B 已经在用的那个会报
+"另一个 entry 已经在用这个主题"。
+
+> **0.3.x 里加不了第二个。** `unique_id = DOMAIN` 加上
+> `_async_current_entries()` 检查，第二次添加一定是
+> `single_instance_allowed`。想接两个协调器只能开两个 HA 实例，
+> 或者自己改 `config_flow.py`。
+
+### 11.2 每个 entry 是完全独立的
+
+| | |
+|---|---|
+| Hub 实例 | 各一个，`hass.data[DOMAIN][entry_id]` 分开存 |
+| MQTT 订阅 | 各 6 个，前缀不同 |
+| 设备表 | 完全隔离，同一个 MAC 在两个 entry 下是两个设备 |
+| Bridge 实体 | **各一个**，`unique_id` 是 `f"{entry_id}_bridge"` |
+| 协调器设备（设备注册表） | **共用一个**，`identifiers={(DOMAIN,"bridge")}` 是写死的 |
+
+最后一行是个已知的粗糙之处：两个 entry 的 Bridge 实体会挂在
+同一个"ESP-NOW Coordinator"设备下面。功能上没问题
+（两个实体的 `unique_id` 不同，`base_topic` 属性能区分是哪个），
+只是设备页上会看到两个 `Bridge` 实体。要分开得把
+`identifiers` 改成带 `entry_id`，代价是老用户的设备条目会断开重建。
+
+### 11.3 `permit_join` 会对所有协调器生效
+
+```python
+async def _permit_join(call: ServiceCall) -> None:
+    duration = int(call.data.get(ATTR_DURATION, 60))
+    for h in hass.data[DOMAIN].values():
+        if isinstance(h, EspNowHub):
+            await h.async_permit_join(duration)
+```
+
+服务**没有 target 参数**，所以调一次会把**每个**协调器的配网窗口都打开。
+
+多协调器场景下这不是你想要的：新设备会连到先响应的那个协调器上，
+不一定是你想要的那个。要精确控制就直接发 MQTT：
+
+```yaml
+action: mqtt.publish
+data:
+  topic: espnow2mqtt_upstairs/bridge/request/permit_join
+  payload: "120"
+```
+
+或者只在想配网的那一刻临时停掉另一个 Bridge 进程。
+
+### 11.4 区分实体属于哪个协调器
+
+每个设备实体的 `espnow2mqtt_mac` 属性不带前缀信息，
+但 Bridge 实体的 `base_topic` 属性有。
+命令失败事件里也带了 `entry_id`：
+
+```yaml
+automation:
+  - alias: 楼上协调器命令失败
+    triggers:
+      - trigger: event
+        event_type: espnow2mqtt_command_failed
+    conditions:
+      - condition: template
+        value_template: "{{ 'upstairs' in trigger.event.data.slug }}"
+    actions: ...
+```
+
+更可靠的办法是按 `entry_id` 过滤，但 `entry_id` 是随机字符串，
+得先去 `.storage/core.config_entries` 里查出来。
+实践中按设备区域（area）分组比按协调器分组更好用。
 
 ---
 

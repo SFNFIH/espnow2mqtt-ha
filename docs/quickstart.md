@@ -98,8 +98,8 @@ HA 最低版本 **2024.1.0**（`hacs.json` 里声明的）。
 
 | 提示 | 原因 | 解决 |
 |---|---|---|
-| "MQTT integration is not set up. Add MQTT first." | HA 里还没配 MQTT | 先加 MQTT 集成 |
-| "ESP-NOW 2 MQTT is already configured" | 已经有一个实例 | **只允许一个**。用现有的，改它的 base topic |
+| "MQTT integration is not set up. Add MQTT first." | HA 里没有已加载的 MQTT config entry | 先加 MQTT 集成，并确认它连上了 broker |
+| "ESP-NOW 2 MQTT is already configured" | **这个 base topic** 已经有 entry 了 | 想接第二个协调器就换一个前缀，见 [usage.md §11](usage.md#11-多个协调器) |
 
 添加完不用重启——集成会立刻订阅并处理 retained 消息。
 
@@ -123,7 +123,7 @@ binary_sensor.esp_now_coordinator_bridge     →  on（已连接）
 | `on` | **集成和 Bridge 通了** ✓ |
 
 这个实体是无条件创建的，所以它一定存在。它是**判断整套系统死活的正确实体**
-（见 [entities.md §11](entities.md#11-bridge-连通性实体)）。
+（见 [entities.md §12.3](entities.md#123-这是判断整套系统死活的正确实体)）。
 
 ### 3.2 已有的设备应该立刻出现
 
@@ -225,7 +225,7 @@ HA → MQTT → Bridge → USB → S3 → 空口 → 设备执行 → ACK + 新�
 
 ### 按设备类型看会出什么实体
 
-见 [entities.md §12](entities.md#12-按设备类型看会出什么)。
+见 [entities.md §12](entities.md#13-按设备类型看会出什么)。
 16 种设备类型都在那张表里。
 
 ### 加几个该有的自动化

@@ -59,7 +59,7 @@ Settings → Devices & Services → 应该看到 "ESP-NOW 2 MQTT" 卡片
 
 ```bash
 ls /config/custom_components/espnow2mqtt/
-# 应该有 13 个 .py 文件 + manifest.json + services.yaml + translations/
+# 应该有 15 个 .py 文件 + manifest.json + services.yaml + translations/
 ```
 
 装完必须**重启 HA**（不是"重新加载配置"——自定义集成的加载只在启动时发生）。
@@ -90,12 +90,27 @@ logger:
 
 | 提示 | 原因 | 解决 |
 |---|---|---|
-| "MQTT integration is not set up. Add MQTT first." | HA 里还没配 MQTT 集成 | 先加 MQTT 集成（Settings → Devices & Services → Add → MQTT） |
-| "ESP-NOW 2 MQTT is already configured" | 已经有一个 entry | **集成只允许一个实例**。用现有的那个，改它的 base topic |
+| "MQTT integration is not set up. Add MQTT first." | HA 里没有**已加载**的 MQTT config entry | 先加 MQTT 集成（Settings → Devices & Services → Add → MQTT） |
+| "ESP-NOW 2 MQTT is already configured" | **这个 base topic** 已经有 entry 了 | 想接第二个协调器就换一个前缀，见 [usage.md §11](usage.md#11-多个协调器) |
 
-第二条是硬限制（`_async_current_entries()` + `unique_id = DOMAIN`），
-所以**一个 HA 接不了两个协调器**。原因见
-[architecture.md §8.5](architecture.md#85-只允许一个-entry)。
+第二条只按 base topic 去重（`unique_id = f"{DOMAIN}:{base}"`），
+所以**一个 HA 可以接多个协调器**，只要前缀不同。
+
+> **0.3.x 里第二条是硬限制**（`_async_current_entries()` +
+> `unique_id = DOMAIN`），一个 HA 只能接一个协调器。
+
+第一条的判定是"存在一个 `state is ConfigEntryState.LOADED` 的 mqtt
+config entry"。如果你明明装了 MQTT 却还是看到这个提示，
+说明 MQTT 集成自己起不来（broker 连不上），
+去 **Settings → Devices & Services → MQTT** 看它是不是红的。
+
+> **0.3.x 里这个 abort 实际上永远不会触发。** 判定写的是
+> `mqtt.DOMAIN not in hass.config.components`，
+> 而 `manifest.json` 里声明了 `dependencies: ["mqtt"]`，
+> HA 在启动 config flow 之前就把 mqtt 组件装载了——条件恒为假。
+> 所以没配 MQTT 时你会看到正常的表单，填完保存，
+> 然后集成静默地什么都收不到。原因见
+> [architecture.md §8.5](architecture.md#85-一个协调器一个-entry)。
 
 ### 1.4 集成在但一个设备都没有
 
@@ -194,7 +209,7 @@ mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 | python3 -m json.tool
 ### 2.5 重启 HA
 
 `hub.devices` 是纯内存的，全靠 retained 消息重建。
-重启后四个订阅建立、retained 消息涌入、平台起来时一次性看到全部设备。
+重启后六个订阅建立、retained 消息涌入、平台起来时一次性看到全部设备。
 
 **如果 MQTT 上确实有 `<slug>/state` 而 HA 里没实体，重启几乎一定能修好。**
 重启后还是没有，那才是真的 bug。
@@ -214,54 +229,95 @@ mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
 
 然后查 [entities.md §1](entities.md#1-caps--平台映射) 的映射表。
 
-### 3.2 `button` cap 不产生任何实体
+### 3.2 按键设备只有诊断实体
 
-这是**已知缺口**：`hub.py` 的推断列表里有 `"button"`，
-但没有任何平台处理它（`SENSOR_SPECS` 和 `BINARY_SPECS` 里都没有，
-也没有 `event` 平台）。
+按键走的是 HA 的 `event` 平台，实体叫 `event.<设备名>_button`。
+如果它没出来：
 
-所以一个按键设备在 HA 里**只有三个诊断实体**。
+1. **确认 caps 里有 `button`**（`button` 只能靠显式 caps 声明，
+   不在 `_CAP_FROM_STATE_KEY` 里，所以光报 `button` 这个键**不会**
+   被推断成能力）：
 
-解决：自己加一个 MQTT sensor，见
-[usage.md §6.1](usage.md#61-读原始状态)。
+```bash
+mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("caps"))'
+```
+
+2. 确认 `event` 平台起来了（HA 2023.8+ 才有这个平台，
+   `hacs.json` 里要求 2024.11.0）
+
+> **0.3.x 里 `button` cap 走到 Hub 就没人接了**，
+> 按键设备在 HA 里只有三个诊断实体。
+> 那时只能自己配 `platform: mqtt` 的自动化绕过集成。
+> **如果你还留着那些 YAML，现在可以删了。**
+
+### 3.2.1 按键实体有了，但按了不触发
+
+`<slug>/state` 是 retained 的、而且每次上报重发全部字段，
+所以**一次按键只能被识别成 `button` 值的变化**。
+连发两个一样的值只会触发一次。
+
+```bash
+# 连按三次，看 button 的值有没有在变
+mosquitto_sub -t espnow2mqtt/<slug>/state -v
+```
+
+`button` 一直是同一个值（比如恒等于 `"press"`）就是这个问题：
+**固件应该把它报成一个每次按键自增的计数器**。
+详见 [entities.md §11.1](entities.md#111-为什么必须把-button-报成计数器)。
 
 ### 3.3 灯没有色温滑条
 
-**这是个时序坑。** 色彩模式在**实体创建的那一刻**决定：
+先确认 MQTT 上到底有没有色温：
 
-```python
-modes = {ColorMode.BRIGHTNESS}
-if "color_temp" in device.state or "color_temp" in device.caps:
-    modes = {ColorMode.COLOR_TEMP}
+```bash
+mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("caps"), d.get("color_temp"), d.get("color_mode"))'
 ```
 
-如果实体是在一条"被 160 字节挤掉了 `color_temp`"的上报上建出来的，
-它会永远是纯调光灯。
+`caps` 里有 `color_temp`、或者 payload 里有 `color_temp` 键、
+或者 `color_mode == "color_temp"`，三者任一成立就该有滑条。
+三个都没有 ⇒ 固件根本没报色温，问题在设备侧
+（[device 仓库 docs/reporting.md](https://github.com/SFNFIH/espnow2mqtt-device/blob/main/docs/reporting.md)）。
 
-**解决：重启 HA。** 重启后 `dev.state` 从 retained 的
-`<slug>/state` 恢复，通常已经包含 `color_temp`，实体重新构造就对了。
+> **0.3.x 里这是个时序坑。** 色彩模式在**实体创建的那一刻**算一次就定死：
+>
+> ```python
+> modes = {ColorMode.BRIGHTNESS}
+> if "color_temp" in device.state or "color_temp" in device.caps:
+>     modes = {ColorMode.COLOR_TEMP}
+> ```
+>
+> 如果实体是在一条"被 160 字节预算挤掉了 `color_temp`"的上报上
+> 建出来的，它会**永远**是纯调光灯，色温到了也不会长出滑条。
+> 唯一的解法是重启 HA，赌重启时 retained 的那条 payload 里带色温。
+>
+> 现在 `supported_color_modes` 是个 property，每次读都重新判定，
+> 色温字段到了滑条就出现。
+> 详见 [entities.md §3.3](entities.md#33-色彩模式是每次读时判定的)。
 
-详见 [entities.md §3.3](entities.md#33-色彩模式的判定有个时序坑)。
+### 3.4 温控器显示 `unknown`
 
-### 3.4 温控器显示"关闭"但设备在运行
-
-`_MODE_MAP` 只认 5 种模式：`off` / `auto` / `cool` / `heat` / `fan_only`。
-
-**其他一律映射成 `HVACMode.OFF`**：
-
-```python
-return _MODE_MAP.get(raw, HVACMode.OFF)
-```
-
-所以如果固件报了 `dry` / `precooling` / `emergency_heat` / `sleep`，
-HA 会显示"关闭"。
+`_MODE_MAP` 只认 5 种模式：`off` / `auto` / `cool` / `heat` / `fan_only`，
+这是刻意和固件的 `en2m_hvac_mode_str()` 对齐的。
+认不出来的值会让 `hvac_mode` 返回 `None`，HA 显示 `unknown`。
 
 ```bash
 mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("hvac_mode"))'
 ```
 
-不在那 5 个里就是这个问题。解决要改 `climate.py` 的 `_MODE_MAP`。
+不在那 5 个里（比如定制固件报了 `dry`）就是这个问题。
+要支持得**两侧都改**：固件的 `en2m_hvac_mode_str()` 加输出、
+`climate.py` 的 `_MODE_MAP` 加条目。
+只改 `_MODE_MAP` 会让 HA 里能选一个固件 parse 不了的模式，
+按下去等于把设备关了。详见
+[entities.md §10.1](entities.md#101-模式表和固件一一对应)。
+
+> **0.3.x 里这种情况显示的是"关闭"**（`_MODE_MAP.get(raw, HVACMode.OFF)`），
+> 而设备实际在运行。这比显示 `unknown` 危险得多：
+> `is_state('climate.x','off')` 会成立，
+> 你的"温控器关了就关窗"自动化会在机器正在制冷的时候触发。
 
 ---
 
@@ -344,23 +400,57 @@ Bridge 日志里（开 `-v`）有 `ack: {... 'ok': True}`，但 HA 里状态不�
   设备会自己夹到能力范围内——这种情况下状态**会**变，只是不等于你设的值
   （[entities.md §3.2](entities.md#32-色温mired--kelvin)）
 
-### 4.5 命令失败了但 HA 不知道
+### 4.5 确认命令是不是真的失败了
 
+**先看 `command_result`。** Bridge 会把协调器对每条命令的裁决
+重新发布到这个主题：
+
+```bash
+mosquitto_sub -t 'espnow2mqtt/+/command_result' -v
 ```
-WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
-WARNING espnow2mqtt: command 8 to AA:BB:CC:DD:EE:FF failed: send_fail
-```
 
-**这些警告只在 Bridge 的日志里，不进 MQTT，所以 HA 完全不知道。**
+然后在 HA 里点一下那个开关。
 
-| `error` | 含义 |
+| 结果 | 结论 |
 |---|---|
-| `timeout` | 发出去了，设备 1.6 秒内没确认（4 次重传后放弃）。设备断电/信号差/中继掉了 |
-| `send_fail` | S3 根本没发出去。路由表里没这个 MAC，或 pending 表满 |
+| `{"id":7,"ok":true,...}` | **命令送到了**。状态还不变 ⇒ 设备收到但拒绝了那个值 → [§4.4](#44-命令-ack-了但状态没变) |
+| `{"id":7,"ok":false,"error":"timeout"}` | 发出去了，设备 1.6 秒内没确认（4 次重传后放弃）。设备断电 / 信号差 / 中继掉了 |
+| `{"id":7,"ok":false,"error":"send_fail"}` | S3 根本没发出去。路由表里没这个 MAC，或 pending 表满 |
+| **完全没输出** | 命令没到 Bridge → [§4.1](#41-集成有没有发出去)，或者 Bridge 版本太老（0.3.x 不发这个主题） |
 
-HA 里的表现就是**状态不变**。要在自动化里察觉，用"发命令 → 等 5 秒 →
-检查状态 → 重试"的模式，见
-[usage.md §7](usage.md#7-命令是单向的)。
+失败的话集成还会在 HA 事件总线上 fire 一个
+`espnow2mqtt_command_failed`。在
+**Developer Tools → Events → Listen to events** 里填这个事件名，
+然后点开关，能直接看到 `slug` / `error` / `payload`：
+
+```json
+{
+  "entry_id": "01H...",
+  "slug": "living_room",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "name": "Living Room",
+  "id": 7,
+  "error": "timeout",
+  "payload": {"switch": "ON"}
+}
+```
+
+`payload` 直接告诉你是哪个操作失败的。
+配告警自动化见 [usage.md §7.2](usage.md#72-espnow2mqtt_command_failed-事件)。
+
+> **0.3.x 里这一段只能去读 Bridge 的日志：**
+>
+> ```
+> WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
+> ```
+>
+> 这些警告不进 MQTT，HA 完全不知道。唯一能在 HA 侧察觉的办法是
+> "发命令 → 等 5 秒 → 检查状态"，而这对没有可读状态的命令
+> （比如 `identify`）完全无效。
+
+注意 `ok: true` 只意味着"协调器把帧送到了设备并收到链路层 ACK"，
+不等于"设备照办了"。区别见
+[usage.md §7.3](usage.md#73-事件不能完全替代状态校验)。
 
 ### 4.6 窗帘位置设错了方向
 
@@ -503,12 +593,38 @@ return max(0, min(255, int(round(level * 255 / 254)))) if level else 0
 如果 HA 里显示的开度和实际相反，检查是不是有人手工发过
 未转换的 `{"position":...}`。
 
-### 6.3 窗帘关到 96% 就显示"已关闭"
+### 6.3 窗帘显示"已关闭"但位置不是 0%
 
-`is_closed` 的判定是 `_closed_pct() >= 95`，不是 `== 100`。
-这是为了容忍电机的机械误差，**和固件侧推导 `cover` 字段用的是同一个阈值**。
+这是**正常的，而且是刻意的**。`is_closed` 先看设备自己报的 `cover`
+字符串，只有它没报时才从位置推断：
 
-正常行为。
+```python
+@property
+def is_closed(self) -> bool | None:
+    cover = str(self._device.state.get("cover", "")).upper()
+    if cover in ("OPEN", "CLOSED"):
+        return cover == "CLOSED"
+    position = self.current_cover_position
+    return None if position is None else position == 0
+```
+
+固件侧关闭判定有容差（电机停在 97% 也算关到底了），
+所以会出现 `cover: "CLOSED"` 配 `position: 97` 的组合。
+**以设备的裁决为准**是对的——它知道自己的限位开关在哪。
+
+```bash
+mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("cover"), d.get("position"))'
+```
+
+> **0.3.x 里集成自己拍了个阈值**（`_closed_pct() >= 95`），
+> 完全不看设备报的 `cover` 字段。如果固件的容差和这个 95 不一样，
+> 两边就会打架：设备说 `CLOSED`、HA 说"开着 6%"。
+> 而且那个版本里 `is_closed` 的返回类型是 `bool`，
+> **位置未知时会返回 `False`（"开着"）**，
+> 一个还没上报过位置的窗帘在 HA 里看着是开的。
+> 现在返回 `None`，显示 `unknown`。
+> 详见 [entities.md §8.2](entities.md#82-is_closed-由设备说了算)。
 
 ### 6.4 温度/功率的数值明显不对
 
@@ -529,19 +645,24 @@ MQTT 上的值和 HA 里显示的一致 ⇒ 问题在设备固件，不在集成
 
 ### 6.5 温度小数位数不对
 
-`SENSOR_SPECS` 里每条 spec 的最后一项是精度，但它**解包出来就没被用过**：
+默认位数来自 `SENSOR_SPECS` 里那条规格的 `precision` 字段，
+通过 `_attr_suggested_display_precision` 交给 HA。
+这只是个**建议值**——你在 UI 里改过之后，实体注册表里的设置优先。
 
-```python
-name, device_class, state_class, unit, category, _prec = SENSOR_SPECS[key]
-```
+想改：**Settings → Entities → 该实体 → 齿轮 → 显示精度**。
 
-所以小数位数由 HA 根据 `device_class` 自己决定。
-想改就在 HA 里改实体的显示精度
-（**Settings → Entities → 该实体 → 齿轮 → 显示精度**）。
+> **0.3.x 里 `precision` 解包出来就扔了**：
+>
+> ```python
+> name, device_class, state_class, unit, category, _prec = SENSOR_SPECS[key]
+> ```
+>
+> 那个 `_prec` 再也没被提到过，小数位数完全由 HA 按 `device_class`
+> 自己猜。功率会显示成 `123.4567 W` 这种。
 
-详见 [entities.md §5.4](entities.md#54-sensor_specs-里的-precision-字段没被用)。
+详见 [entities.md §5.4](entities.md#54-规格是数据类不是元组)。
 
-### 6.6 状态值只增不减
+### 6.6 状态里有个早就不该存在的字段
 
 `dev.state` 是**累积合并**的：
 
@@ -553,23 +674,39 @@ merged.update(payload)
 `dict.update()` 不删 key。所以**设备没法通过"不发某个字段"来表达
 "这个字段消失了"**。一旦某个 key 出现过，它就留着直到 HA 重启。
 
-这是刻意的（配合 160 字节预算的降级机制，见
+这是刻意的，而且是必需的：160 字节的 payload 预算会让固件
+在拥挤时分批上报字段（见
 [state-flow.md §3.7](state-flow.md#37-合并与归一化)），
-但如果你改了固件、去掉了一个属性，老的 key 会一直挂在那儿。
+如果不累积，每次上报都会把上一批的字段清空。
 
-**解决：重启 HA。**
+代价是你改了固件、去掉一个属性之后，老的 key 会一直挂在那儿。
+**解决：重启 HA**（内存表重建，只从 retained 的那一条恢复）。
+
+> **注意这一条只管 `dev.state`，不管实体。**
+> 如果 `caps` 里的某个能力消失了，对应的**实体会自删**，
+> 见 [state-flow.md §6](state-flow.md#6-实体能增也能减)。
+> `caps` 走的是替换而不是合并——显式上报的 `caps` 列表会整个换掉旧的。
 
 ### 6.7 同一个设备有两套实体
 
-三种可能：
+0.4.0 之后只剩一种可能：**Bridge 的 `--ha-discovery` 和本集成同时开着**，
+表现是实体名带 `_2` 后缀。
 
-| 现象 | 原因 | 详见 |
-|---|---|---|
-| 同时有 `switch.x_switch` 和 `light.x_light` | Switch 实体在亮度字段到达之前就建好了，之后 caps 升级成 light，但 Switch 不会被删 | [state-flow.md §6](state-flow.md#6-实体只增不减) |
-| HA 里有两个设备，一个叫 slug 一个叫真名 | `slug:` 占位设备问题 | [state-flow.md §3.3](state-flow.md#33-slug-占位设备) |
-| 实体名带 `_2` 后缀 | **Bridge 的 `--ha-discovery` 和本集成同时开着** | 见下 |
+> **0.3.x 里还有两种，都已经修掉了：**
+>
+> | 现象 | 0.3.x 的原因 |
+> |---|---|
+> | 同时有 `switch.x_switch` 和 `light.x_light` | Switch 实体在亮度字段到达之前就建好了，之后 caps 升级成 light 并把 `switch` 从 caps 里拿掉，但**实体只增不减**，Switch 永远留着（还停在最后一个值上） |
+> | HA 里有两个设备，一个叫 slug 一个叫真名 | retained 的 `<slug>/state` 先到、`bridge/devices` 后到，产生了一个 `slug:` 占位设备，真 MAC 到了以后**两个并存** |
+>
+> 现在前者会自删（`EspNowSwitch._requires_cap = "switch"`），
+> 后者会被合并（`_absorb_placeholder`）。
+> 从 0.3.x 升上来的话，**这两种多余实体会在第一次收到状态上报时
+> 自动消失**，不用手工删。
+> 详见 [state-flow.md §6](state-flow.md#6-实体能增也能减) 和
+> [state-flow.md §3.3](state-flow.md#33-slug-占位设备)。
 
-**第三种最常见。** Bridge 的 `--ha-discovery` 默认是关的，
+Bridge 的 `--ha-discovery` 默认是关的，
 但如果你之前开过，它发的 retained discovery config 主题还在：
 
 ```bash
@@ -668,7 +805,7 @@ INFO custom_components.espnow2mqtt.hub: ESP-NOW hub listening on espnow2mqtt/#
 （`unique_id` 还在注册表里），所以自动化不会断。
 
 如果连设备都要重新配对，见
-[usage.md §9](usage.md#9-移除设备) 和
+[usage.md §9](usage.md#9-彻底删掉一个设备) 和
 [host 仓库 troubleshooting §9.4](https://github.com/SFNFIH/espnow2mqtt-host/blob/main/docs/troubleshooting.md#94-完全重来)。
 
 ---
@@ -692,7 +829,7 @@ INFO custom_components.espnow2mqtt.hub: ESP-NOW hub listening on espnow2mqtt/#
 ## 相关文档
 
 - [quickstart.md](quickstart.md) — 装的正确顺序和验证步骤
-- [entities.md](entities.md) — 每个实体的字段、换算、已知限制
+- [entities.md](entities.md) — 每个实体的字段、换算、边界条件
 - [state-flow.md](state-flow.md) — 数据流，理解"为什么这条消息被丢了"
 - [architecture.md](architecture.md) — 可用性和信号机制
 - [usage.md](usage.md) — 自动化、模板、绕过集成的办法

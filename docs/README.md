@@ -21,7 +21,7 @@
 
 | | |
 |---|---|
-| **做** | 订阅 4 个 MQTT 主题；在内存里维护设备表；按 `caps` 动态创建 7 种平台的实体；把 HA 的服务调用翻译成 `<slug>/set` 上的 JSON |
+| **做** | 订阅 6 个 MQTT 主题；在内存里维护设备表；按 `caps` 动态创建 8 种平台的实体；把 HA 的服务调用翻译成 `<slug>/set` 上的 JSON |
 | **不做** | 不碰串口、不认识 ESP-NOW、不解析空口帧。**没有 Bridge 就什么都没有** |
 | **不做** | 不用 MQTT Discovery。实体是集成自己建的，所以 Bridge 的 `--ha-discovery` 应该**保持关闭** |
 | **不做** | 不写 YAML。设备自动出现（`iot_class: local_push`） |
@@ -36,6 +36,7 @@
 | 查 `caps` → 平台的映射、每个实体的字段和单位换算 | [entities.md](entities.md) |
 | 查服务、自动化写法、模板取值 | [usage.md](usage.md) |
 | 实体没出来 / 状态不更新 / 控制没反应 | [troubleshooting.md](troubleshooting.md) |
+| 知道 0.3.x 有哪些毛病、0.4.0 改了什么 | 本页 [0.4.0 修掉的实现缺口](#040-修掉的实现缺口) |
 | 查 MQTT 主题和 payload | [host 仓库 docs/mqtt.md](https://github.com/SFNFIH/espnow2mqtt-host/blob/main/docs/mqtt.md) |
 | 配对说明和控制 JSON 速查 | [homeassistant.md](homeassistant.md) |
 
@@ -54,24 +55,39 @@
 2. [state-flow.md](state-flow.md) 再看数据怎么流、实体怎么被动态创建
 3. [entities.md](entities.md) 最后看每个平台的具体映射
 
-## 已知的实现缺口
+## 0.4.0 修掉的实现缺口
 
-这几条是读代码时发现的**真实问题**，都在对应文档里详细写了原因和影响，
-不是"未来计划"而是"当前行为"：
+这一版之前，这份文档里有一张"已知的实现缺口"表，列的是读代码时发现的、
+**当时确实存在**的行为。它们现在全部修掉了，每条都有回归测试钉住
+（`tests/test_gaps.py`，一个测试对应一条）。留在这里是因为
+如果你在用 0.3.x，这些就是你会遇到的症状：
 
-| 缺口 | 影响 | 详见 |
+| 0.3.x 的行为 | 0.4.0 起 | 详见 |
 |---|---|---|
-| 实体只增不减 | 设备丢掉一个 `cap` 后旧实体永远留着 | [state-flow.md](state-flow.md#6-实体只增不减) |
-| `bridge_info` 从未被填充 | 集成拿不到协调器的信道/固件版本 | [architecture.md](architecture.md#34-没有订阅-bridgeinfo) |
-| `slug:` 占位设备 | 极端顺序下可能产生一套重复实体 | [state-flow.md](state-flow.md#33-slug-占位设备) |
-| 命令失败没有反馈 | `<slug>/set` 是单向的，HA 不知道命令是否成功 | [usage.md](usage.md#7-命令是单向的) |
+| 实体只增不减：设备丢掉一个 `cap` 后旧实体永远留着 | cap 消失时实体自删，并从实体注册表里清掉；cap 回来还能重建 | [state-flow.md](state-flow.md#6-实体能增也能减) |
+| `bridge_info` 从未被填充，拿不到协调器的信道/固件版本 | 订阅 `bridge/info`，落到 Bridge 实体属性和协调器设备的 `sw_version` | [architecture.md](architecture.md#34-bridgeinfo协调器自述) |
+| `slug:` 占位设备永远不和真设备合并，可能出两套实体 | 拿到真 MAC 后把占位设备连状态一起并进去，并删掉占位的设备条目 | [state-flow.md](state-flow.md#33-slug-占位设备) |
+| 命令失败没有反馈，`<slug>/set` 是纯单向 | Bridge 发布 `<slug>/command_result`，集成订阅并抛 `espnow2mqtt_command_failed` 事件 | [usage.md](usage.md#7-命令的成败反馈) |
+| caps 映射表里 `fan_mode`/`target_temperature`/`current_temperature` 三行取不到，只报这些键的风扇和温控器认不出来 | 键列表和映射合成一张表，不可能再漂移 | [state-flow.md](state-flow.md#341-_cap_from_state_key级-3-的全部内容) |
+| 灯的 color mode 在 `__init__` 里冻住，第一帧没带 `color_temp` 就永远是纯调光灯 | 每次读都重新判定 | [entities.md](entities.md#32-色温mired--kelvin) |
+| sensor 的精度字段解包后丢掉了 | 落到 `suggested_display_precision` | [entities.md](entities.md#5-sensor) |
+| Bridge 掉线时设备实体不重算可用性 | Hub 在 `bridge/state` 变化时扇出给所有设备 | [architecture.md](architecture.md#6-dispatcher-信号) |
+| `button` cap 走到 Hub 就没人接，不产生任何实体 | 新增 `event` 平台 | [entities.md](entities.md#11-event按钮) |
+| `ATTR_MAC`/`CAPS`/`HOP`/`VIA`/`NODE_ROLE` 是没人引用的常量 | 成为每个实体的属性，模板里能取到拓扑 | [usage.md](usage.md#5-在模板里取值) |
+| `unique_id` 是域名，永远只能有一个条目 | 改成按主题前缀区分，第二个协调器可以加进来 | [usage.md](usage.md#11-多个协调器) |
+
+顺带修掉的还有三处：实体基类里指针刷新的条件写反了；温控器收到不认识的模式会
+上报成 `off`（在撒谎，现在报 unknown）；`mqtt_not_ready` 这个 abort 分支
+不可达（`dependencies` 里写了 `mqtt` 会让 HA 一开流程就把它加载上，
+所以那个判断永远成立）。
 
 ## 版本
 
 | | |
 |---|---|
-| 集成版本 | `manifest.json` 里 `0.3.0` |
-| HA 最低版本 | `hacs.json` 里 `2024.1.0` |
+| 集成版本 | `manifest.json` 里 `0.4.0` |
+| HA 最低版本 | `hacs.json` 里 `2024.11.0`（`OptionsFlow.config_entry`、`ClimateEntityFeature.TURN_ON`、`event` 平台都要这个版本以上） |
 | 依赖 | `mqtt` 集成（`dependencies`），**没有** Python 包依赖（`requirements: []`） |
 | `iot_class` | `local_push` |
 | 域名 | `espnow2mqtt` |
+| 测试 | `pip install -r requirements_test.txt && pytest`（跑真实 HA core，35 个测试） |

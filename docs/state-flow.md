@@ -7,10 +7,10 @@
 
 1. [两条方向](#1-两条方向)
 2. [启动序列](#2-启动序列)
-3. [上行：`<slug>/state` 的完整处理](#3-上行slugstate-的完整处理)
+3. [上行：`<slug>/state` 的完整处理](#3-上行state-的完整处理)
 4. [上行：`bridge/devices`](#4-上行bridgedevices)
-5. [上行：`<slug>/availability`](#5-上行slugavailability)
-6. [实体只增不减](#6-实体只增不减)
+5. [上行：`<slug>/availability`](#5-上行availability)
+6. [实体能增也能减](#6-实体能增也能减)
 7. [下行：从服务调用到 MQTT](#7-下行从服务调用到-mqtt)
 8. [完整时序：新设备入网](#8-完整时序新设备入网)
 9. [完整时序：一次开灯](#9-完整时序一次开灯)
@@ -138,23 +138,25 @@ def _on_device_state(self, msg: mqtt.ReceiveMessage) -> None:
 ### 3.2 按 slug 找设备
 
 ```python
-mac = None
-for m, d in self.devices.items():
-    if d.slug == slug:
-        mac = m
-        break
+def _find_by_slug(self, slug: str) -> EspNowDevice | None:
+    for dev in self.devices.values():
+        if dev.slug == slug:
+            return dev
+    return None
 ```
 
 **线性扫描**，因为设备表是按 MAC 索引的，而主题里只有 slug。
 设备数量是几十的量级，每条消息扫一遍无所谓。
+`_on_availability` 和 `_on_command_result` 也用这个方法。
 
 ### 3.3 `slug:` 占位设备
 
 ```python
-if mac is None:
-    # 合成一个无 MAC 的设备，等设备列表到达
-    mac = f"slug:{slug}"
-    self.devices[mac] = EspNowDevice(mac=mac, name=slug)
+dev = self._find_by_slug(slug)
+if dev is None:
+    # 先停在 slug 名下，等 bridge/devices 揭晓 MAC
+    dev = EspNowDevice(mac=f"slug:{slug}", name=slug)
+    self.devices[dev.mac] = dev
 ```
 
 如果 `<slug>/state` 比 `bridge/devices` **先**到，集成还不知道这个 slug
@@ -162,38 +164,53 @@ if mac is None:
 
 这样做的好处是**不丢状态**：实体会被创建出来，能用，只是设备注册表里
 的 `identifiers` 是 `(DOMAIN, "slug:relay1")` 而不是真 MAC
-（`entity.py` 里也因此有 `not dev.mac.startswith("slug:")` 的判断，
+（`entity.py` 里也因此有 `not dev.is_placeholder` 的判断，
 避免给它加一条假的 MAC 连接）。
 
-> **⚠️ 但占位设备永远不会和真设备合并**
->
-> `_on_devices` 是按真 MAC 建/找对象的：
->
-> ```python
-> dev = self.devices.get(mac) or EspNowDevice(mac=mac)
-> ```
->
-> 它**不会**去找有没有同 slug 的 `slug:` 占位项，也不会删掉它。
-> 所以一旦触发了这条路径，`hub.devices` 里会同时存在
-> `"slug:relay1"` 和 `"AA:BB:CC:DD:EE:FF"` 两个对象，
-> 而且它们的 `slug` 属性相同。后果：
->
-> | 后果 | 说明 |
-> |---|---|
-> | **两套实体** | `slug:relay1_switch` 和 `AA:BB:...:FF_switch` 两个 unique_id |
-> | 占位的那套会卡住 | 之后所有 `<slug>/state` 都会命中**第一个**匹配的（`for` 循环 `break`），dict 顺序决定是谁 |
-> | HA 里两个设备 | 一个叫 `relay1`（来自占位），一个叫真名 |
->
-> **实践中很少触发**，因为：
->
-> 1. `bridge/devices` 的订阅在 `<base>/+/state` **之前**建立，
->    retained 消息按订阅顺序投递，所以启动时设备列表先到。
-> 2. 新设备入网时，Bridge 的 `on_uplink` 先发 `device` 行
->    （→ 重写 `bridge/devices`）再发 `state` 行，顺序也是对的。
->
-> 真要撞上，清理办法是**重启 HA**（`hub.devices` 是纯内存的，
-> 重启后从 retained 消息重建，这次顺序是对的），
-> 然后在 HA 里手工删掉那个多余的设备。
+#### 真 MAC 到了以后：合并
+
+`_on_devices` 每处理一个设备都会调一次 `_absorb_placeholder()`：
+
+```python
+def _absorb_placeholder(self, dev: EspNowDevice) -> None:
+    key = f"slug:{dev.slug}"
+    placeholder = self.devices.get(key)
+    if placeholder is None or placeholder is dev:
+        return
+    merged = dict(placeholder.state)   # 占位的是旧的
+    merged.update(dev.state)           # 真设备的新值盖上去
+    dev.state = merged
+    for cap in placeholder.caps:
+        if cap not in dev.caps:
+            dev.caps.append(cap)
+    if dev.hop is None:
+        dev.hop = placeholder.hop
+    ...
+    del self.devices[key]
+    async_dispatcher_send(self.hass, SIGNAL_DEVICE_REMOVED, self.entry.entry_id, key)
+```
+
+那条 `SIGNAL_DEVICE_REMOVED` 有两个接收方：
+
+| 接收方 | 做什么 |
+|---|---|
+| `EspNowEntity._handle_device_removed` | 绑在占位设备上的实体自删 |
+| `__init__.py` 的 `_device_removed` | 把 `(DOMAIN, "slug:relay1")` 这个设备条目从设备注册表里摘掉，并把 `hub.discovered` 里以该 MAC 开头的 uid 全清掉 |
+
+所以合并之后 HA 里只剩一个设备、一套实体，状态还是占位期间收到的那份。
+
+**实践中很少触发**，因为：
+
+1. `bridge/devices` 的订阅在 `<base>/+/state` **之前**建立，
+   retained 消息按订阅顺序投递，所以启动时设备列表先到。
+2. 新设备入网时，Bridge 的 `on_uplink` 先发 `device` 行
+   （→ 重写 `bridge/devices`）再发 `state` 行，顺序也是对的。
+
+> 0.3.x 里没有合并这一步：`_on_devices` 按真 MAC 建对象，
+> 既不去找同 slug 的占位项也不删它。于是 `hub.devices` 里会同时存在
+> `"slug:relay1"` 和 `"AA:BB:CC:DD:EE:FF"` 两个 `slug` 属性相同的对象，
+> HA 里出两个设备、两套实体，而且之后所有 `<slug>/state` 都只命中
+> dict 里先出现的那个。唯一的清理办法是重启 HA 再手工删设备。
 
 ### 3.4 caps 推断：三级 fall-through
 
@@ -204,25 +221,9 @@ if isinstance(caps, list):
 elif isinstance(caps, str) and caps:
     dev.caps = [c.strip().lower() for c in caps.split(",") if c.strip()]
 else:
-    for key in ("temperature", "humidity", "pressure", "illuminance",
-                "switch", "light", "contact", "occupancy", "motion",
-                "smoke", "carbon_monoxide", "power", "energy",
-                "fan", "cover", "lock", "climate",
-                "brightness", "color_temp", "percentage", "position",
-                "hvac_mode", "button"):
-        if key in payload and key not in dev.caps:
-            cap = {
-                "brightness": "light",
-                "color_temp": "light",
-                "percentage": "fan",
-                "fan_mode": "fan",
-                "position": "cover",
-                "hvac_mode": "climate",
-                "target_temperature": "climate",
-                "current_temperature": "climate",
-            }.get(key, key)
-            if cap not in dev.caps:
-                dev.caps.append(cap)
+    for key, cap in _CAP_FROM_STATE_KEY.items():
+        if key in payload and cap not in dev.caps:
+            dev.caps.append(cap)
 ```
 
 | 级 | 依据 | 说明 |
@@ -235,18 +236,34 @@ else:
 那就是权威；之后某次上报把 `caps` 挤掉了（160 字节预算），会走级 3
 在原有基础上追加——不会把已知能力擦掉。
 
-> **映射字典里有三个死条目。** `"fan_mode"`、`"target_temperature"`、
-> `"current_temperature"` 在映射表里，但**不在上面那个 `for` 的 key 元组里**，
-> 所以永远不会被查到。
->
-> 实际影响：一个只报 `{"fan_mode":"high"}` 而不报 `caps` 也不报
-> `percentage` 的风扇，**不会被识别成 fan**。
-> 正常的 `en2m` 固件总是报显式 `caps`，所以撞不上；
-> 但如果你写第三方固件，记得带 `caps`。
+Bridge 那边也是同一条原则：只有显式 `caps` 能替换存下来的列表，
+它自己那套只认七个键的粗推断只能追加
+（见 host 仓库 [`docs/bridge.md`](https://github.com/SFNFIH/espnow2mqtt-host/blob/main/docs/bridge.md)）。
 
-`"light"` 也在 key 元组里，所以 payload 里出现字面上叫 `light` 的 key
-会直接产生 `light` cap。`en2m` 不会发这个 key（它发 `switch` +
-`brightness`），这是给第三方固件留的口子。
+#### 3.4.1 `_CAP_FROM_STATE_KEY`：级 3 的全部内容
+
+大部分键就是它自己的 cap；剩下的是**只有一个平台会用**的取值键，
+所以看见它们就足以推断出那个平台：
+
+| payload 键 | 推出的 cap | 为什么 |
+|---|---|---|
+| `temperature` `humidity` `pressure` `illuminance` `power` `energy` | 同名 | 测量量 |
+| `switch` `contact` `occupancy` `motion` `smoke` `carbon_monoxide` | 同名 | 二元量 |
+| `light` `fan` `cover` `lock` `climate` `button` | 同名 | 给第三方固件直接声明用；`en2m` 不发这些字面键 |
+| `brightness` `level` `color_temp` `color_mode` | `light` | 只有灯会报 |
+| `percentage` `fan_mode` | `fan` | 只有风扇会报 |
+| `position` | `cover` | 只有窗帘会报 |
+| `hvac_mode` `target_temperature` `current_temperature` | `climate` | 只有温控器会报 |
+| `button_action` | `button` | 见 [entities.md §11](entities.md#11-event按钮) |
+
+> 0.3.x 里这份信息分成两半写：一个 `for` 循环的键元组，和一个
+> 键→cap 的映射字典。两边漂移了——`fan_mode`、`target_temperature`、
+> `current_temperature` 在映射字典里，**却不在被遍历的元组里**，
+> 所以那三行永远取不到。实际影响是一个只报 `{"fan_mode":"high"}`
+> 或只报 `{"target_temperature":21}` 而不报 `caps` 的设备
+> **认不出是风扇/温控器**，一个实体都不出。
+>
+> 现在只有一张表，这种漂移在结构上就不可能再发生。
 
 ### 3.5 灯优先于开关
 
@@ -272,18 +289,21 @@ if "light" in dev.caps and "switch" in dev.caps:
 保证一个调光灯只出 **Light** 实体，不会同时出一个 Switch。
 两个实体控制同一个设备会让 UI 和自动化都很混乱。
 
-> **⚠️ 但如果 Switch 实体已经建好了，它不会被删**
->
-> 场景：设备第一条上报只有 `{"switch":"ON"}`（亮度被 160 字节挤掉了），
-> caps = `["switch"]` → **Switch 实体被创建**。
-> 第二条上报带了 `brightness` → caps 变成 `["light"]` → **Light 实体被创建**。
->
-> 结果：**同一个设备上同时有 `switch.x_switch` 和 `light.x_light`**。
-> 两个都能用（都往同一个 `<slug>/set` 发命令），但状态会打架
-> （Switch 只看 `switch` 字段，Light 也看 `switch` 字段，
-> 所以其实两个显示是一致的，只是多了一个冗余实体）。
->
-> 见 [§6](#6-实体只增不减)。处理办法是在 HA 里手工禁用/删除多余的实体。
+#### 升级后旧的 Switch 实体会被删掉
+
+场景：设备第一条上报只有 `{"switch":"ON"}`（亮度被 160 字节挤掉了），
+caps = `["switch"]` → **Switch 实体被创建**。
+第二条上报带了 `brightness` → caps 变成 `["light"]`
+→ **Light 实体被创建，同时 Switch 实体自删**。
+
+能自删是因为 `EspNowSwitch._requires_cap = "switch"`，而第 2 条规则
+刚好把 `switch` 从 caps 里拿掉了，所以 `_is_stale()` 成立。
+机制见 [§6](#6-实体能增也能减)。
+
+> 0.3.x 里 Switch 实体不会被删，结果是**同一个设备上同时挂着
+> `switch.x_switch` 和 `light.x_light`**。两个都能用（都往同一个
+> `<slug>/set` 发命令），显示也一致（都看 `switch` 字段），
+> 但多出来的那个实体会一直在设备页上，只能手工禁用或删除。
 
 ### 3.6 拓扑字段
 
@@ -313,27 +333,12 @@ if payload.get("via"):
 ```python
 merged = dict(dev.state)
 merged.update(payload)
-if "switch" in merged:
-    sw = str(merged["switch"]).upper()
-    merged["switch"] = "ON" if sw in ("ON", "1", "TRUE") else "OFF"
-for binary_key in ("contact", "occupancy", "motion", "smoke", "carbon_monoxide"):
-    if binary_key in merged:
-        c = str(merged[binary_key]).upper()
-        merged[binary_key] = "ON" if c in ("ON", "1", "TRUE", "OPEN", "DETECTED") else "OFF"
-if "lock" in merged:
-    lk = str(merged["lock"]).upper()
-    merged["lock"] = "LOCKED" if lk in ("LOCKED", "LOCK", "1", "TRUE") else "UNLOCKED"
-if "cover" in merged:
-    cv = str(merged["cover"]).upper()
-    if cv in ("CLOSED", "CLOSE"):
-        merged["cover"] = "CLOSED"
-    elif cv in ("OPEN", "OPENING"):
-        merged["cover"] = "OPEN"
-    else:
-        merged["cover"] = cv
-dev.state = merged
+dev.state = _normalize_state(merged)
 dev.online = True
 ```
+
+`_normalize_state()` 是模块级函数（`hub.py` 末尾），归一化的具体规则见
+[§3.8](#38-归一化表)。
 
 **这是第二次合并。** Bridge 已经在它那边合并过一次了
 （host 仓库 `docs/bridge.md §6.1`），集成又合一次。
@@ -443,81 +448,119 @@ def _on_availability(self, msg: mqtt.ReceiveMessage) -> None:
     if len(parts) < 3:
         return
     slug = parts[-2]
-    raw = msg.payload
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="ignore")
-    online = str(raw).strip().lower() == "online"
-    for mac, dev in self.devices.items():
-        if dev.slug == slug:
-            dev.online = online
-            async_dispatcher_send(self.hass, SIGNAL_DEVICE_UPDATED, self.entry.entry_id, mac)
-            return
+    online = self._text(msg.payload).strip().lower() == "online"
+    dev = self._find_by_slug(slug)
+    if dev is None:
+        return
+    dev.online = online
+    async_dispatcher_send(self.hass, SIGNAL_DEVICE_UPDATED, self.entry.entry_id, dev.mac)
 ```
 
 **注意这里不会创建占位设备。** 如果 availability 先到而设备表还没有这个 slug，
-循环找不到就什么都不做。这是对的——availability 不携带任何状态，
-为它建一个空设备没有意义。
+`_find_by_slug` 返回 `None` 就什么都不做。这是对的——availability
+不携带任何状态，为它建一个空设备没有意义。
 
 `online` 的判断是严格的 `== "online"`，所以任何其他值（包括空 payload）
 都会被当成离线。空 retained 消息（`mosquitto_pub -r -n`）会让设备变离线。
 
-`return` 在循环里——**只更新第一个匹配的设备**。正常情况下 slug 是唯一的，
-但如果触发了 `slug:` 占位问题（[§3.3](#33-slug-占位设备)），
-就只有其中一个会被更新。
+`_find_by_slug` 只返回**第一个**匹配的设备。正常情况下 slug 是唯一的；
+占位期间同一个 slug 会短暂有两个对象，但那时占位的那个就是唯一的那个，
+真设备一出现就会把它吸收掉（[§3.3](#33-slug-占位设备)）。
 
 ---
 
-## 6. 实体只增不减
+## 6. 实体能增也能减
 
-这是集成最明显的一个设计缺口，值得单独一节。
+实体的存在条件很简单一句话：**设备声明了这个能力，实体就在；
+不声明了，实体就走。**
 
-### 6.1 机制
+### 6.1 谁负责删
 
-每个平台的 `_discover` 里：
+不是平台，是实体自己。`EspNowEntity` 上有一个类属性：
 
 ```python
-known: set[str] = set()          # 闭包变量，在 async_setup_entry 里
-...
-uid = f"{mac}_{cap}"
-if uid in known:
-    return
-known.add(uid)
-async_add_entities([...])
+_requires_cap: str | None = None
 ```
 
-**只有 `async_add_entities`，没有任何地方调用实体的 `async_remove()`。**
+每个平台的实体类把它设成自己赖以存在的那个 cap：
 
-### 6.2 后果
-
-| 场景 | 后果 |
+| 实体类 | `_requires_cap` |
 |---|---|
-| 设备的 `caps` 里丢掉了一个能力（换固件、或者 160 字节挤掉了） | 对应实体**永远留着**，状态停在最后已知值 |
-| 设备先被识别成 switch 后被识别成 light | **两个实体都在**（[§3.5](#35-灯优先于开关)） |
-| 设备被 `unpair` 了 | 设备和实体都留在 HA 里，变成不可用 |
-| `slug:` 占位问题 | 两套实体 |
+| `EspNowSwitch` | `switch` |
+| `EspNowLight` | `light` |
+| `EspNowCover` | `cover` |
+| `EspNowLock` | `lock` |
+| `EspNowFan` | `fan` |
+| `EspNowClimate` | `climate` |
+| `EspNowBinary` | 自己那个键（`contact` / `occupancy` / …） |
+| `EspNowButtonEvent` | `button` |
+| `EspNowSensor`（测量量） | 自己那个键（`temperature` / `power` / …） |
+| `EspNowSensor`（诊断量 hop / rssi / node_role） | **`None`** |
+| `EspNowBridgeBinary` | 不适用（它不是 `EspNowEntity`） |
 
-### 6.3 为什么这样设计还算可以接受
+诊断量留空是因为它们对每个 mesh 节点都成立，不依赖任何能力。
 
-因为 `caps` 在 Hub 里是**只增不减**的（级 3 是 append，级 1/2 是替换但
-只在显式 `caps` 到达时发生），而正常设备的能力集是固定的。
-所以在正常使用下这个问题不会出现。
+### 6.2 判定与执行
 
-而且"实体不会自己消失"对 HA 用户来说其实是个好性质——
+`_handle_update` 每次被调用都会查一遍：
+
+```python
+def _is_stale(self) -> bool:
+    # caps 为空表示"还不知道"，不是"什么都不支持"
+    return bool(
+        self._requires_cap
+        and self._device.caps
+        and self._requires_cap not in self._device.caps
+    )
+```
+
+`self._device.caps` 非空这个条件很重要：设备刚出现、`caps` 还没到的时候
+列表是空的，如果据此删实体，每个设备都会在启动时被误删一遍。
+
+成立就走 `_async_purge()`：
+
+```python
+async def _async_purge(self) -> None:
+    if self._attr_unique_id:
+        self._hub.discovered.discard(self._attr_unique_id)
+    registry = er.async_get(self.hass)
+    if self.entity_id and registry.async_get(self.entity_id):
+        registry.async_remove(self.entity_id)   # 连带把实体从 hass 摘掉
+    else:
+        await self.async_remove(force_remove=True)
+```
+
+两个动作缺一不可：
+
+| 动作 | 少了会怎样 |
+|---|---|
+| `hub.discovered.discard(uid)` | cap 再回来的时候 `_discover` 会认为"已经建过了"，实体永远回不来 |
+| `registry.async_remove(entity_id)` | 实体会以"restored / unavailable"的形态留在实体注册表里，设备页上还是能看到 |
+
+`_purging` 标志防止连续几条消息各起一个删除任务。
+
+### 6.3 三种触发场景
+
+| 场景 | 结果 |
+|---|---|
+| 设备从 switch 升级成 light | Switch 实体自删，Light 实体建出来（[§3.5](#35-灯优先于开关)） |
+| 换了固件，`caps` 显式变了 | 旧能力的实体自删，新能力的实体建出来 |
+| 占位设备被真设备吸收 | 占位那套实体连设备条目一起删掉（[§3.3](#33-slug-占位设备)） |
+
+能力回来时实体也会回来，`tests/test_gaps.py::test_capability_coming_back_recreates_the_entity`
+钉的就是这条。
+
+### 6.4 什么不会被自动删
+
+**设备本身。** 设备被 `unpair` 之后，Bridge 不再发它的状态，
+HA 里的设备和实体会变成不可用但不会消失。这是刻意的：
 自动化引用的实体突然消失比一个不可用的实体更难排查。
 
-### 6.4 怎么清理
+要彻底删掉一个设备见 [usage.md §9](usage.md#9-彻底删掉一个设备)。
 
-手工。**Settings → Devices & Services → espnow2mqtt → 找到设备 → 
-点多余的实体 → 齿轮 → 删除**。
-
-如果整个设备都不要了：先在 HA 里删除设备，然后确保 MQTT 上没有
-retained 的 `<slug>/state` 和 `<slug>/availability`
-（否则下次 HA 重启它又会回来）：
-
-```bash
-mosquitto_pub -t espnow2mqtt/old_name/state -r -n
-mosquitto_pub -t espnow2mqtt/old_name/availability -r -n
-```
+> 0.3.x 里**没有任何地方调用实体的移除**，而且"已创建过"的集合是每个平台
+> 各自的闭包变量，外面碰不到。所以上面三种场景全都会留下多余实体，
+> 只能手工在 HA 里禁用或删除。
 
 ---
 
@@ -624,7 +667,7 @@ C3：收到 beacon → 选父节点 → 发 HELLO 帧（带 payload）
   ├─ bridge/devices → hub._on_devices
   │     ├─ devices["AA:.."] = EspNowDevice(name="living_room", model="c3-light", online=True, rssi=-58, hop=1)
   │     └─ SIGNAL_DEVICE_UPDATED("AA:..")
-  │           └─ 七个平台 _discover：caps 还是空的 → 只有 sensor 会建
+  │           └─ 八个平台 _discover：caps 还是空的 → 只有 sensor 会建
   │                 hop / node_role 两个诊断实体（+ rssi，因为 dev.rssi 不是 None）
   ├─ living_room/availability → hub._on_availability → online = True
   └─ living_room/state → hub._on_device_state
@@ -684,7 +727,7 @@ USB  → {"type":"ack","mac":"AA:..","id":7,"ok":true,...}
 USB  → {"type":"state","mac":"AA:..","payload":{"switch":"ON","brightness":128,...}}
   │
   ▼ Bridge
-  ├─ ack → LOG.debug（不进 MQTT）
+  ├─ ack → MQTT ← espnow2mqtt/living_room/command_result = {"id":7,"ok":true,...}
   └─ state → merged → MQTT ← espnow2mqtt/living_room/state = {...}
   │
   ▼ HA 集成 hub._on_device_state
@@ -702,12 +745,30 @@ USB  → {"type":"state","mac":"AA:..","payload":{"switch":"ON","brightness":128
 `round(round(128*254/255)*255/254) = 128`，在大部分值上是无损的，
 但个别值会差 1（见 [entities.md](entities.md#31-亮度0254--0255)）。
 
-**如果命令失败**（设备断电），链路会在 S3 那里断掉：
-`{"ok":false,"error":"timeout"}` → Bridge 打一条 `WARNING` →
-**MQTT 上什么都不发** → HA 里实体状态不变。
+**如果命令失败**（设备断电），链路会在 S3 那里断掉，
+但不再是无声的：
 
-所以 **HA 侧感知命令失败的唯一方式是"状态没变"**。
-见 [usage.md §7](usage.md#7-命令是单向的)。
+```
+空口 ← CMD 帧 × 4（0/400/800/1200 ms，都没等到 ACK）
+  │
+  ▼ S3
+USB  → {"type":"ack","mac":"AA:..","id":7,"ok":false,"error":"timeout"}
+  │
+  ▼ Bridge._on_ack
+  ├─ LOG.warning("command 7 to living_room failed: timeout")
+  └─ MQTT ← espnow2mqtt/living_room/command_result =
+            {"id":7,"ok":false,"error":"timeout",
+             "mac":"AA:..","payload":{"switch":"ON","brightness":128},
+             "elapsed_ms":1284}                          (不 retained)
+  │
+  ▼ HA 集成 hub._on_command_result
+  ├─ LOG.warning
+  └─ hass.bus.async_fire("espnow2mqtt_command_failed", {...})
+```
+
+实体状态**仍然不变**（设备没执行，就不该显示成执行了），
+但现在有一个 HA 事件可以挂自动化。
+见 [usage.md §7](usage.md#7-命令的成败反馈)。
 
 ---
 
@@ -720,11 +781,13 @@ USB  → {"type":"state","mac":"AA:..","payload":{"switch":"ON","brightness":128
 |---|:-:|---|
 | `bridge/state` | ✓ | 立刻恢复 → `bridge_online` |
 | `bridge/devices` | ✓ | 立刻恢复 → 全部设备的 name/model/online/rssi/hop/via/role |
+| `bridge/info` | ✓ | 立刻恢复 → 协调器的信道/固件/MAC |
 | `<slug>/state` | ✓ | 立刻恢复 → caps 和业务状态 |
 | `<slug>/availability` | ✓ | 立刻恢复 → online |
+| `<slug>/command_result` | ✗ | 刻意不 retain——命令结果描述的是一个瞬间，重放毫无意义 |
 | `<slug>/<key>`（扁平） | ✗ | **集成不订阅这些，无关** |
 
-所以**重启后几乎是瞬间恢复的**——四个订阅建立后 retained 消息立刻涌入，
+所以**重启后几乎是瞬间恢复的**——订阅建立后 retained 消息立刻涌入，
 平台起来时全部设备已经在表里了。
 
 实体不会重新创建（HA 的实体注册表按 `unique_id` 认人），
