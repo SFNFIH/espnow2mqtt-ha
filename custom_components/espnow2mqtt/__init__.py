@@ -19,6 +19,11 @@ PLATFORMS = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.SWITCH,
+    Platform.LIGHT,
+    Platform.FAN,
+    Platform.COVER,
+    Platform.LOCK,
+    Platform.CLIMATE,
 ]
 
 SERVICE_PERMIT_JOIN = "permit_join"

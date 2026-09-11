@@ -1,4 +1,4 @@
-"""Sensor platform — temperature, humidity, power, energy, diagnostics."""
+"""Sensor platform — measurements + diagnostics."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    LIGHT_LUX,
     PERCENTAGE,
     UnitOfEnergy,
     UnitOfPower,
+    UnitOfPressure,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
@@ -40,6 +42,22 @@ SENSOR_SPECS: dict[str, tuple] = {
         PERCENTAGE,
         None,
         1,
+    ),
+    "pressure": (
+        "Pressure",
+        SensorDeviceClass.PRESSURE,
+        SensorStateClass.MEASUREMENT,
+        UnitOfPressure.HPA,
+        None,
+        1,
+    ),
+    "illuminance": (
+        "Illuminance",
+        SensorDeviceClass.ILLUMINANCE,
+        SensorStateClass.MEASUREMENT,
+        LIGHT_LUX,
+        None,
+        0,
     ),
     "power": (
         "Power",
@@ -83,6 +101,8 @@ SENSOR_SPECS: dict[str, tuple] = {
     ),
 }
 
+_MEASUREMENT_KEYS = ("temperature", "humidity", "pressure", "illuminance", "power", "energy")
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -104,8 +124,7 @@ async def async_setup_entry(
         for key in wanted:
             if key not in SENSOR_SPECS:
                 continue
-            # Only add measurement sensors if cap present (diagnostics always ok)
-            if key in ("temperature", "humidity", "power", "energy") and key not in dev.caps:
+            if key in _MEASUREMENT_KEYS and key not in dev.caps:
                 continue
             uid = f"{mac}_{key}"
             if uid in known:
@@ -146,7 +165,7 @@ class EspNowSensor(EspNowEntity, SensorEntity):
         val = self._device.state.get(key)
         if val is None:
             return None
-        if key in ("temperature", "humidity", "power", "energy"):
+        if key in _MEASUREMENT_KEYS:
             try:
                 return float(val)
             except (TypeError, ValueError):

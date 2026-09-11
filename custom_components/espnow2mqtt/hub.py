@@ -198,9 +198,50 @@ class EspNowHub:
         elif isinstance(caps, str) and caps:
             dev.caps = [c.strip().lower() for c in caps.split(",") if c.strip()]
         else:
-            for key in ("temperature", "humidity", "switch", "contact", "power", "energy", "button"):
+            for key in (
+                "temperature",
+                "humidity",
+                "pressure",
+                "illuminance",
+                "switch",
+                "light",
+                "contact",
+                "occupancy",
+                "motion",
+                "smoke",
+                "carbon_monoxide",
+                "power",
+                "energy",
+                "fan",
+                "cover",
+                "lock",
+                "climate",
+                "brightness",
+                "color_temp",
+                "percentage",
+                "position",
+                "hvac_mode",
+                "button",
+            ):
                 if key in payload and key not in dev.caps:
-                    dev.caps.append(key)
+                    # Map value keys to platform caps where needed
+                    cap = {
+                        "brightness": "light",
+                        "color_temp": "light",
+                        "percentage": "fan",
+                        "fan_mode": "fan",
+                        "position": "cover",
+                        "hvac_mode": "climate",
+                        "target_temperature": "climate",
+                        "current_temperature": "climate",
+                    }.get(key, key)
+                    if cap not in dev.caps:
+                        dev.caps.append(cap)
+        # Promote light over switch when brightness/color present
+        if ("brightness" in payload or "color_temp" in payload or "level" in payload) and "light" not in dev.caps:
+            dev.caps.append("light")
+        if "light" in dev.caps and "switch" in dev.caps:
+            dev.caps = [c for c in dev.caps if c != "switch"]
         if payload.get("node_role"):
             dev.node_role = str(payload["node_role"])
         if "hop" in payload:
@@ -215,9 +256,21 @@ class EspNowHub:
         if "switch" in merged:
             sw = str(merged["switch"]).upper()
             merged["switch"] = "ON" if sw in ("ON", "1", "TRUE") else "OFF"
-        if "contact" in merged:
-            c = str(merged["contact"]).upper()
-            merged["contact"] = "ON" if c in ("ON", "1", "TRUE", "OPEN") else "OFF"
+        for binary_key in ("contact", "occupancy", "motion", "smoke", "carbon_monoxide"):
+            if binary_key in merged:
+                c = str(merged[binary_key]).upper()
+                merged[binary_key] = "ON" if c in ("ON", "1", "TRUE", "OPEN", "DETECTED") else "OFF"
+        if "lock" in merged:
+            lk = str(merged["lock"]).upper()
+            merged["lock"] = "LOCKED" if lk in ("LOCKED", "LOCK", "1", "TRUE") else "UNLOCKED"
+        if "cover" in merged:
+            cv = str(merged["cover"]).upper()
+            if cv in ("CLOSED", "CLOSE"):
+                merged["cover"] = "CLOSED"
+            elif cv in ("OPEN", "OPENING"):
+                merged["cover"] = "OPEN"
+            else:
+                merged["cover"] = cv
         dev.state = merged
         dev.online = True
         async_dispatcher_send(self.hass, SIGNAL_DEVICE_UPDATED, self.entry.entry_id, mac)
@@ -228,8 +281,14 @@ class EspNowHub:
             self.hass, f"{self.base}/{TOPIC_PERMIT_JOIN}", str(seconds), 0, False
         )
 
-    async def async_set_switch(self, device: EspNowDevice, value: str) -> None:
-        payload = json.dumps({"switch": value})
+    async def async_publish_set(self, device: EspNowDevice, payload: dict) -> None:
         await mqtt.async_publish(
-            self.hass, f"{self.base}/{device.slug}/set", payload, 0, False
+            self.hass,
+            f"{self.base}/{device.slug}/set",
+            json.dumps(payload),
+            0,
+            False,
         )
+
+    async def async_set_switch(self, device: EspNowDevice, value: str) -> None:
+        await self.async_publish_set(device, {"switch": value})

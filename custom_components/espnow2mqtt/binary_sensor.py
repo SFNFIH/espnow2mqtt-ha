@@ -1,4 +1,4 @@
-"""Binary sensor platform — contact, bridge connectivity."""
+"""Binary sensor platform — contact, occupancy, smoke, bridge."""
 
 from __future__ import annotations
 
@@ -16,6 +16,14 @@ from .const import DOMAIN
 from .entity import EspNowEntity
 from .hub import SIGNAL_BRIDGE_UPDATED, SIGNAL_DEVICE_UPDATED, EspNowDevice, EspNowHub
 
+BINARY_SPECS: dict[str, tuple[str, BinarySensorDeviceClass]] = {
+    "contact": ("Contact", BinarySensorDeviceClass.DOOR),
+    "occupancy": ("Occupancy", BinarySensorDeviceClass.OCCUPANCY),
+    "motion": ("Motion", BinarySensorDeviceClass.MOTION),
+    "smoke": ("Smoke", BinarySensorDeviceClass.SMOKE),
+    "carbon_monoxide": ("Carbon Monoxide", BinarySensorDeviceClass.CO),
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -23,7 +31,6 @@ async def async_setup_entry(
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
     known: set[str] = set()
 
-    # Bridge connectivity entity
     async_add_entities([EspNowBridgeBinary(hub)])
 
     @callback
@@ -33,11 +40,17 @@ async def async_setup_entry(
         dev = hub.devices.get(mac)
         if not dev:
             return
-        if "contact" in dev.caps:
-            uid = f"{mac}_contact"
-            if uid not in known:
-                known.add(uid)
-                async_add_entities([EspNowContact(hub, dev)])
+        entities: list[EspNowBinary] = []
+        for key, (name, device_class) in BINARY_SPECS.items():
+            if key not in dev.caps:
+                continue
+            uid = f"{mac}_{key}"
+            if uid in known:
+                continue
+            known.add(uid)
+            entities.append(EspNowBinary(hub, dev, key, name, device_class))
+        if entities:
+            async_add_entities(entities)
 
     entry.async_on_unload(
         async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
@@ -84,15 +97,21 @@ class EspNowBridgeBinary(BinarySensorEntity):
             self.async_write_ha_state()
 
 
-class EspNowContact(EspNowEntity, BinarySensorEntity):
-    """Door/window contact."""
+class EspNowBinary(EspNowEntity, BinarySensorEntity):
+    """Generic binary sensor from caps."""
 
-    _attr_device_class = BinarySensorDeviceClass.DOOR
-
-    def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
-        super().__init__(hub, device, "contact")
-        self._attr_name = "Contact"
+    def __init__(
+        self,
+        hub: EspNowHub,
+        device: EspNowDevice,
+        key: str,
+        name: str,
+        device_class: BinarySensorDeviceClass,
+    ) -> None:
+        super().__init__(hub, device, key)
+        self._attr_name = name
+        self._attr_device_class = device_class
 
     @property
     def is_on(self) -> bool:
-        return str(self._device.state.get("contact", "OFF")).upper() == "ON"
+        return str(self._device.state.get(self._key, "OFF")).upper() == "ON"

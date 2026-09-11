@@ -1,8 +1,8 @@
-"""Switch platform — devices with cap `switch` (not `light`)."""
+"""Lock platform — DoorLock."""
 
 from __future__ import annotations
 
-from homeassistant.components.switch import SwitchEntity
+from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -24,13 +24,13 @@ async def async_setup_entry(
         if entry_id != entry.entry_id:
             return
         dev = hub.devices.get(mac)
-        if not dev or "switch" not in dev.caps or "light" in dev.caps:
+        if not dev or "lock" not in dev.caps:
             return
-        uid = f"{mac}_switch"
+        uid = f"{mac}_lock"
         if uid in known:
             return
         known.add(uid)
-        async_add_entities([EspNowSwitch(hub, dev)])
+        async_add_entities([EspNowLock(hub, dev)])
 
     entry.async_on_unload(
         async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
@@ -39,19 +39,20 @@ async def async_setup_entry(
         _discover(entry.entry_id, mac)
 
 
-class EspNowSwitch(EspNowEntity, SwitchEntity):
-    """MQTT-backed switch."""
+class EspNowLock(EspNowEntity, LockEntity):
+    """MQTT-backed lock."""
+
+    _attr_name = "Lock"
 
     def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
-        super().__init__(hub, device, "switch")
-        self._attr_name = "Switch"
+        super().__init__(hub, device, "lock")
 
     @property
-    def is_on(self) -> bool:
-        return str(self._device.state.get("switch", "OFF")).upper() == "ON"
+    def is_locked(self) -> bool:
+        return str(self._device.state.get("lock", "UNLOCKED")).upper() == "LOCKED"
 
-    async def async_turn_on(self, **kwargs) -> None:
-        await self._hub.async_set_switch(self._device, "ON")
+    async def async_lock(self, **kwargs) -> None:
+        await self._hub.async_publish_set(self._device, {"lock": "LOCK"})
 
-    async def async_turn_off(self, **kwargs) -> None:
-        await self._hub.async_set_switch(self._device, "OFF")
+    async def async_unlock(self, **kwargs) -> None:
+        await self._hub.async_publish_set(self._device, {"lock": "UNLOCK"})
