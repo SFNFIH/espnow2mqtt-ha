@@ -888,7 +888,12 @@ class EspNowButtonEvent(EspNowEntity, EventEntity):
 
 连续两条一模一样的值，和"同一条消息被重发"在 MQTT 层面
 是完全无法区分的。所以设备侧的正确做法是把 `button` 当成
-**一个每次按键都自增的计数器**：
+**一个每次按键都自增的计数器**。`en2m` 固件的 Switch cluster
+（`EN2M_DEVICE_TYPE_GENERIC_SWITCH`）就是这么做的，
+`en2m_report_button()` 自己维护那个计数器，例程见
+[device 仓库 examples/scene_switch](https://github.com/SFNFIH/espnow2mqtt-device/blob/main/docs/examples.md#scene_switch)。
+
+上报长这样：
 
 ```json
 {"button": 7, "button_action": "double_press"}
@@ -1125,7 +1130,7 @@ unavailable——因为协调器一挂，几十个设备实体会同时变 unava
 | CO 报警 | `["carbon_monoxide"]` | `binary_sensor.*_carbon_monoxide`（CO） |
 | 气压计 | `["pressure"]` | `sensor.*_pressure` |
 | 光照传感器 | `["illuminance"]` | `sensor.*_illuminance` |
-| 按键 | `["button"]` | `event.*_button`（[§11](#11-event按钮)） |
+| `scene_switch` | `["button"]` | `event.*_button`（[§11](#11-event按钮)） |
 | `router`（中继节点） | 通常没有 caps | 只有诊断实体 |
 
 `router` 节点只出诊断实体是对的——它是纯中继，没有外设。

@@ -246,6 +246,11 @@ mosquitto_sub -t espnow2mqtt/<slug>/state -C 1 \
 2. 确认 `event` 平台起来了（HA 2023.8+ 才有这个平台，
    `hacs.json` 里要求 2024.11.0）
 
+3. 确认固件那边建了 Switch cluster。`en2m` 的
+   `EN2M_DEVICE_TYPE_GENERIC_SWITCH` 会加 `button` cap，
+   例程是 `examples/scene_switch`。用别的设备类型的话 caps 里不会有它
+   （见 [device 仓库 docs/data-model.md](https://github.com/SFNFIH/espnow2mqtt-device/blob/main/docs/data-model.md)）
+
 > **0.3.x 里 `button` cap 走到 Hub 就没人接了**，
 > 按键设备在 HA 里只有三个诊断实体。
 > 那时只能自己配 `platform: mqtt` 的自动化绕过集成。
