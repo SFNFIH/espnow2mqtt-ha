@@ -14,6 +14,24 @@ Config Flow，设备自动出实体，**不用写实体 YAML**。
 
 ---
 
+## 文档
+
+完整文档在 **[`docs/`](docs/)**。按需求找：
+
+| 我想…… | 看这篇 |
+|------|------|
+| 装上并跑通（含前置条件检查） | [docs/quickstart.md](docs/quickstart.md) |
+| 搞懂集成的分层、Hub、dispatcher 信号 | [docs/architecture.md](docs/architecture.md) |
+| 搞懂一条 MQTT 消息怎么变成实体状态、实体怎么被创建 | [docs/state-flow.md](docs/state-flow.md) |
+| 查 `caps` → 平台的映射、每个实体的字段和单位换算 | [docs/entities.md](docs/entities.md) |
+| 查服务、自动化写法、模板取值 | [docs/usage.md](docs/usage.md) |
+| 实体没出来 / 状态不更新 / 控制没反应 | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| 查 MQTT 主题和 payload | [host 仓库 docs/mqtt.md](https://github.com/SFNFIH/espnow2mqtt-host/blob/main/docs/mqtt.md) |
+
+文档索引和推荐阅读路线：**[docs/README.md](docs/README.md)**
+
+---
+
 ## 安装前准备
 
 1. HA 已配置 **MQTT**（如 Mosquitto）
