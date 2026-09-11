@@ -1,0 +1,4 @@
+# Pulls in a real Home Assistant core plus its test harness, so the tests
+# exercise the actual entity platforms, dispatcher and registries.
+# The pinned harness decides the HA version the tests run against.
+pytest-homeassistant-custom-component==0.13.205

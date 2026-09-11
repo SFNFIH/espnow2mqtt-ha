@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
@@ -24,6 +24,31 @@ from .hub import (
     EspNowDevice,
     EspNowHub,
 )
+
+
+@callback
+def async_sync_device_registry(
+    hass: HomeAssistant, identifier: str, **fields: Any
+) -> None:
+    """Push late-arriving device metadata into the device registry.
+
+    `device_info` is only consulted the first time an entity is added, so
+    anything the bridge tells us afterwards — the coordinator's firmware
+    version, a model name that arrived with the second report — would otherwise
+    never show up on the device page.
+    """
+    wanted = {key: value for key, value in fields.items() if value}
+    if not wanted:
+        return
+    registry = dr.async_get(hass)
+    device = registry.async_get_device(identifiers={(DOMAIN, identifier)})
+    if device is None:
+        return
+    stale = {
+        key: value for key, value in wanted.items() if getattr(device, key) != value
+    }
+    if stale:
+        registry.async_update_device(device.id, **stale)
 
 
 class EspNowEntity(Entity):
@@ -99,6 +124,9 @@ class EspNowEntity(Entity):
         if self._is_stale():
             self._schedule_purge()
             return
+        async_sync_device_registry(
+            self.hass, self._device.mac, model=self._device.model
+        )
         self.async_write_ha_state()
 
     @callback

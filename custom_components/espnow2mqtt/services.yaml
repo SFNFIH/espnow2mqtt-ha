@@ -1,10 +1,6 @@
 permit_join:
-  name: Permit join
-  description: Open pairing window on the USB coordinator so new ESP-NOW devices can join.
   fields:
     duration:
-      name: Duration
-      description: Seconds to keep pairing open (1–300).
       example: 60
       default: 60
       selector:

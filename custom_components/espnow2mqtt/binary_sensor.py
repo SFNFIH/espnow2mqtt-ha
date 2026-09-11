@@ -16,7 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .discovery import async_setup_device_discovery
-from .entity import EspNowEntity
+from .entity import EspNowEntity, async_sync_device_registry
 from .hub import SIGNAL_BRIDGE_UPDATED, EspNowDevice, EspNowHub
 
 BINARY_SPECS: dict[str, tuple[str, BinarySensorDeviceClass]] = {
@@ -105,8 +105,17 @@ class EspNowBridgeBinary(BinarySensorEntity):
 
     @callback
     def _on_bridge(self, entry_id: str) -> None:
-        if entry_id == self._hub.entry.entry_id:
-            self.async_write_ha_state()
+        if entry_id != self._hub.entry.entry_id:
+            return
+        # This entity is created at setup, long before `bridge/info` arrives, so
+        # the firmware version has to be written to the registry after the fact.
+        info = self._hub.bridge_info
+        async_sync_device_registry(
+            self.hass,
+            "bridge",
+            sw_version=str(info["fw"]) if info.get("fw") else None,
+        )
+        self.async_write_ha_state()
 
 
 class EspNowBinary(EspNowEntity, BinarySensorEntity):

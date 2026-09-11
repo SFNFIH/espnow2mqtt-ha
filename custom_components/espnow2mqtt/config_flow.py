@@ -6,7 +6,8 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.components import mqtt
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import TextSelector
 
@@ -17,13 +18,27 @@ def _clean(base: str | None) -> str:
     return (base or DEFAULT_BASE_TOPIC).strip().strip("/") or DEFAULT_BASE_TOPIC
 
 
+def _mqtt_is_ready(hass: HomeAssistant) -> bool:
+    """Whether there is a working MQTT integration to subscribe through.
+
+    Not a `hass.config.components` check: declaring `mqtt` in the manifest
+    makes HA load it as a dependency the moment this flow starts, so that test
+    always passed and the abort below was unreachable. What matters is whether
+    MQTT has a *configured, loaded* entry — without one there is no broker.
+    """
+    return any(
+        entry.state is ConfigEntryState.LOADED
+        for entry in hass.config_entries.async_entries(mqtt.DOMAIN)
+    )
+
+
 class EspNow2MqttConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow."""
 
     VERSION = 1
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
-        if mqtt.DOMAIN not in self.hass.config.components:
+        if not _mqtt_is_ready(self.hass):
             return self.async_abort(reason="mqtt_not_ready")
 
         errors: dict[str, str] = {}
