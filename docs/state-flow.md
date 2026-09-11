@@ -7,9 +7,9 @@
 
 1. [两条方向](#1-两条方向)
 2. [启动序列](#2-启动序列)
-3. [上行：`<slug>/state` 的完整处理](#3-上行state-的完整处理)
+3. [上行：`<slug>/state` 的完整处理](#3-上行slugstate-的完整处理)
 4. [上行：`bridge/devices`](#4-上行bridgedevices)
-5. [上行：`<slug>/availability`](#5-上行availability)
+5. [上行：`<slug>/availability`](#5-上行slugavailability)
 6. [实体能增也能减](#6-实体能增也能减)
 7. [下行：从服务调用到 MQTT](#7-下行从服务调用到-mqtt)
 8. [完整时序：新设备入网](#8-完整时序新设备入网)
