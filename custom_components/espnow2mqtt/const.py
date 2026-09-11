@@ -15,3 +15,9 @@ TOPIC_BRIDGE_STATE = "bridge/state"
 TOPIC_BRIDGE_DEVICES = "bridge/devices"
 TOPIC_BRIDGE_INFO = "bridge/info"
 TOPIC_PERMIT_JOIN = "bridge/request/permit_join"
+
+# Per-device suffix the bridge publishes command outcomes on
+TOPIC_SUFFIX_COMMAND_RESULT = "command_result"
+
+# Fired on the HA event bus when a command the integration sent did not land
+EVENT_COMMAND_FAILED = f"{DOMAIN}_command_failed"

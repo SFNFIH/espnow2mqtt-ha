@@ -4,14 +4,17 @@
     "step": {
       "user": {
         "title": "ESP-NOW 2 MQTT",
-        "description": "通过 MQTT 连接 USB 协调器桥接。请先安装 ESP-NOW 2 MQTT 插件（Add-on）或自行运行 bridge。设备会自动出现，无需编写实体配置。",
+        "description": "通过 MQTT 连接 USB 协调器桥接。请先安装 ESP-NOW 2 MQTT 插件（Add-on）或自行运行 bridge。设备会自动出现，无需编写实体配置。每个协调器添加一个条目，各用自己的主题前缀。",
         "data": {
           "base_topic": "MQTT 主题前缀"
+        },
+        "data_description": {
+          "base_topic": "必须和 bridge 的 --base-topic 一致。多个协调器请各用不同的前缀。"
         }
       }
     },
     "abort": {
-      "already_configured": "ESP-NOW 2 MQTT 已配置",
+      "already_configured": "该主题前缀上已经配置过一个协调器",
       "mqtt_not_ready": "尚未配置 MQTT 集成，请先添加 MQTT"
     }
   },
@@ -19,8 +22,24 @@
     "step": {
       "init": {
         "title": "ESP-NOW 2 MQTT 选项",
+        "description": "改主题前缀会重载集成。实体的历史会保留，但在新前缀上出现 bridge 之前会一直不可用。",
         "data": {
           "base_topic": "MQTT 主题前缀"
+        }
+      }
+    },
+    "error": {
+      "already_configured": "已有别的条目在用这个主题前缀"
+    }
+  },
+  "services": {
+    "permit_join": {
+      "name": "允许入网",
+      "description": "打开配对窗口，允许新设备入网。对所有已配置的协调器都生效。",
+      "fields": {
+        "duration": {
+          "name": "时长",
+          "description": "配对窗口保持打开的秒数（1–300）。"
         }
       }
     }

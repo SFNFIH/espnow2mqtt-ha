@@ -4,14 +4,17 @@
     "step": {
       "user": {
         "title": "ESP-NOW 2 MQTT",
-        "description": "Connect to the USB coordinator bridge over MQTT. Install the ESP-NOW 2 MQTT add-on (or run the bridge) first. Devices appear automatically — no YAML.",
+        "description": "Connect to the USB coordinator bridge over MQTT. Install the ESP-NOW 2 MQTT add-on (or run the bridge) first. Devices appear automatically — no YAML. Add one entry per coordinator, each with its own base topic.",
         "data": {
           "base_topic": "MQTT base topic"
+        },
+        "data_description": {
+          "base_topic": "Must match the bridge's --base-topic. Use a different topic for each coordinator."
         }
       }
     },
     "abort": {
-      "already_configured": "ESP-NOW 2 MQTT is already configured",
+      "already_configured": "A coordinator is already configured on this base topic",
       "mqtt_not_ready": "MQTT integration is not set up. Add MQTT first."
     }
   },
@@ -19,8 +22,24 @@
     "step": {
       "init": {
         "title": "ESP-NOW 2 MQTT options",
+        "description": "Changing the base topic reloads the integration. Entities keep their history, but they stay unavailable until a bridge publishes on the new topic.",
         "data": {
           "base_topic": "MQTT base topic"
+        }
+      }
+    },
+    "error": {
+      "already_configured": "Another entry already uses this base topic"
+    }
+  },
+  "services": {
+    "permit_join": {
+      "name": "Permit join",
+      "description": "Open the mesh for new devices to pair. Applies to every configured coordinator.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "How long pairing stays open, in seconds (1–300)."
         }
       }
     }

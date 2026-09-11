@@ -12,7 +12,7 @@
     "mqtt"
   ],
   "requirements": [],
-  "version": "0.3.0",
+  "version": "0.4.0",
   "loggers": [
     "custom_components.espnow2mqtt"
   ]

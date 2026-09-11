@@ -4,47 +4,38 @@ from __future__ import annotations
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .discovery import async_setup_device_discovery
 from .entity import EspNowEntity
-from .hub import SIGNAL_DEVICE_UPDATED, EspNowDevice, EspNowHub
+from .hub import EspNowDevice, EspNowHub
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
 
-    @callback
-    def _discover(entry_id: str, mac: str) -> None:
-        if entry_id != entry.entry_id:
-            return
-        dev = hub.devices.get(mac)
-        if not dev or "switch" not in dev.caps or "light" in dev.caps:
-            return
-        uid = f"{mac}_switch"
-        if uid in known:
-            return
-        known.add(uid)
-        async_add_entities([EspNowSwitch(hub, dev)])
+    def _build(hub: EspNowHub, device: EspNowDevice) -> list[EspNowSwitch]:
+        if "switch" not in device.caps or "light" in device.caps:
+            return []
+        return [EspNowSwitch(hub, device)]
 
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
-    )
-    for mac in list(hub.devices):
-        _discover(entry.entry_id, mac)
+    async_setup_device_discovery(hass, entry, hub, async_add_entities, _build)
 
 
 class EspNowSwitch(EspNowEntity, SwitchEntity):
     """MQTT-backed switch."""
 
+    _attr_name = "Switch"
+    # The hub drops `switch` from caps as soon as a device turns out to be a
+    # light, which deletes this entity instead of leaving a duplicate behind.
+    _requires_cap = "switch"
+
     def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
         super().__init__(hub, device, "switch")
-        self._attr_name = "Switch"
 
     @property
     def is_on(self) -> bool:

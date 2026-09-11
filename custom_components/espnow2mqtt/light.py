@@ -9,13 +9,13 @@ from homeassistant.components.light import (
     LightEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .discovery import async_setup_device_discovery
 from .entity import EspNowEntity
-from .hub import SIGNAL_DEVICE_UPDATED, EspNowDevice, EspNowHub
+from .hub import EspNowDevice, EspNowHub
 
 
 def _mireds_to_kelvin(mireds: int) -> int:
@@ -32,26 +32,13 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
 
-    @callback
-    def _discover(entry_id: str, mac: str) -> None:
-        if entry_id != entry.entry_id:
-            return
-        dev = hub.devices.get(mac)
-        if not dev or "light" not in dev.caps:
-            return
-        uid = f"{mac}_light"
-        if uid in known:
-            return
-        known.add(uid)
-        async_add_entities([EspNowLight(hub, dev)])
+    def _build(hub: EspNowHub, device: EspNowDevice) -> list[EspNowLight]:
+        if "light" not in device.caps:
+            return []
+        return [EspNowLight(hub, device)]
 
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
-    )
-    for mac in list(hub.devices):
-        _discover(entry.entry_id, mac)
+    async_setup_device_discovery(hass, entry, hub, async_add_entities, _build)
 
 
 class EspNowLight(EspNowEntity, LightEntity):
@@ -60,14 +47,34 @@ class EspNowLight(EspNowEntity, LightEntity):
     _attr_name = "Light"
     _attr_min_color_temp_kelvin = 2000
     _attr_max_color_temp_kelvin = 6500
+    _requires_cap = "light"
 
     def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
         super().__init__(hub, device, "light")
-        modes: set[ColorMode] = {ColorMode.BRIGHTNESS}
-        if "color_temp" in device.state or "color_temp" in device.caps:
-            modes = {ColorMode.COLOR_TEMP}
-        self._attr_supported_color_modes = modes
-        self._attr_color_mode = next(iter(modes))
+
+    def _is_cct(self) -> bool:
+        """Whether this bulb has shown any sign of colour-temperature support.
+
+        Resolved on every read rather than once in the constructor: a bulb that
+        was created from a report which happened not to carry `color_temp` used
+        to be stuck as a plain dimmer for the lifetime of the entity, even after
+        later reports proved otherwise.
+        """
+        return (
+            "color_temp" in self._device.state
+            or "color_temp" in self._device.caps
+            or str(self._device.state.get("color_mode", "")).lower() == "color_temp"
+        )
+
+    @property
+    def supported_color_modes(self) -> set[ColorMode]:
+        # COLOR_TEMP already implies brightness, and HA rejects a set that pairs
+        # BRIGHTNESS with a richer mode, so this is one or the other.
+        return {ColorMode.COLOR_TEMP} if self._is_cct() else {ColorMode.BRIGHTNESS}
+
+    @property
+    def color_mode(self) -> ColorMode:
+        return ColorMode.COLOR_TEMP if self._is_cct() else ColorMode.BRIGHTNESS
 
     @property
     def is_on(self) -> bool:
@@ -103,8 +110,6 @@ class EspNowLight(EspNowEntity, LightEntity):
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
             payload["color_temp"] = _kelvin_to_mireds(kelvin)
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-            self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
         await self._hub.async_publish_set(self._device, payload)
 
     async def async_turn_off(self, **kwargs) -> None:

@@ -3,47 +3,40 @@
 from __future__ import annotations
 
 from homeassistant.components.cover import (
+    ATTR_POSITION,
     CoverEntity,
     CoverEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .discovery import async_setup_device_discovery
 from .entity import EspNowEntity
-from .hub import SIGNAL_DEVICE_UPDATED, EspNowDevice, EspNowHub
+from .hub import EspNowDevice, EspNowHub
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
 
-    @callback
-    def _discover(entry_id: str, mac: str) -> None:
-        if entry_id != entry.entry_id:
-            return
-        dev = hub.devices.get(mac)
-        if not dev or "cover" not in dev.caps:
-            return
-        uid = f"{mac}_cover"
-        if uid in known:
-            return
-        known.add(uid)
-        async_add_entities([EspNowCover(hub, dev)])
+    def _build(hub: EspNowHub, device: EspNowDevice) -> list[EspNowCover]:
+        if "cover" not in device.caps:
+            return []
+        return [EspNowCover(hub, device)]
 
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
-    )
-    for mac in list(hub.devices):
-        _discover(entry.entry_id, mac)
+    async_setup_device_discovery(hass, entry, hub, async_add_entities, _build)
 
 
 class EspNowCover(EspNowEntity, CoverEntity):
-    """MQTT-backed cover."""
+    """MQTT-backed cover.
+
+    The firmware follows Matter's `CurrentPositionLiftPercentage`, where 0 is
+    fully open and 100 is fully closed. HA uses the opposite convention, so
+    every position crossing this class is inverted.
+    """
 
     _attr_name = "Cover"
     _attr_supported_features = (
@@ -52,26 +45,42 @@ class EspNowCover(EspNowEntity, CoverEntity):
         | CoverEntityFeature.STOP
         | CoverEntityFeature.SET_POSITION
     )
+    _requires_cap = "cover"
 
     def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
         super().__init__(hub, device, "cover")
 
-    def _closed_pct(self) -> int:
+    def _closed_pct(self) -> int | None:
         raw = self._device.state.get("position")
         try:
             return max(0, min(100, int(raw)))
         except (TypeError, ValueError):
-            cover = str(self._device.state.get("cover", "OPEN")).upper()
-            return 100 if cover == "CLOSED" else 0
+            pass
+        # A cover that only reports the coarse OPEN/CLOSED string still gets a
+        # usable position, just a two-valued one.
+        cover = str(self._device.state.get("cover", "")).upper()
+        if cover == "CLOSED":
+            return 100
+        if cover == "OPEN":
+            return 0
+        return None
 
     @property
     def current_cover_position(self) -> int | None:
-        # HA: 0 = closed, 100 = open
-        return 100 - self._closed_pct()
+        closed = self._closed_pct()
+        return None if closed is None else 100 - closed
 
     @property
-    def is_closed(self) -> bool:
-        return self._closed_pct() >= 95
+    def is_closed(self) -> bool | None:
+        # The device decides when it counts as shut — the firmware publishes the
+        # verdict alongside the raw position. Only guess from the position when
+        # it stayed silent, rather than applying a threshold of our own that
+        # could contradict it.
+        cover = str(self._device.state.get("cover", "")).upper()
+        if cover in ("OPEN", "CLOSED"):
+            return cover == "CLOSED"
+        position = self.current_cover_position
+        return None if position is None else position == 0
 
     async def async_open_cover(self, **kwargs) -> None:
         await self._hub.async_publish_set(self._device, {"cover": "OPEN"})
@@ -83,7 +92,5 @@ class EspNowCover(EspNowEntity, CoverEntity):
         await self._hub.async_publish_set(self._device, {"cover": "STOP"})
 
     async def async_set_cover_position(self, **kwargs) -> None:
-        # kwargs position is HA open% → firmware closed%
-        open_pct = int(kwargs.get("position", 0))
-        closed = max(0, min(100, 100 - open_pct))
-        await self._hub.async_publish_set(self._device, {"position": closed})
+        open_pct = max(0, min(100, int(kwargs.get(ATTR_POSITION, 0))))
+        await self._hub.async_publish_set(self._device, {"position": 100 - open_pct})

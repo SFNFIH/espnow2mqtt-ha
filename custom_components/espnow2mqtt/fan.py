@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .discovery import async_setup_device_discovery
 from .entity import EspNowEntity
-from .hub import SIGNAL_DEVICE_UPDATED, EspNowDevice, EspNowHub
+from .hub import EspNowDevice, EspNowHub
 
+#: Mirrors `en2m_fan_mode_str()` in the firmware, in the same order.
 PRESET_MODES = ["off", "low", "medium", "high", "on", "auto", "smart"]
 
 
@@ -19,26 +20,13 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     hub: EspNowHub = hass.data[DOMAIN][entry.entry_id]
-    known: set[str] = set()
 
-    @callback
-    def _discover(entry_id: str, mac: str) -> None:
-        if entry_id != entry.entry_id:
-            return
-        dev = hub.devices.get(mac)
-        if not dev or "fan" not in dev.caps:
-            return
-        uid = f"{mac}_fan"
-        if uid in known:
-            return
-        known.add(uid)
-        async_add_entities([EspNowFan(hub, dev)])
+    def _build(hub: EspNowHub, device: EspNowDevice) -> list[EspNowFan]:
+        if "fan" not in device.caps:
+            return []
+        return [EspNowFan(hub, device)]
 
-    entry.async_on_unload(
-        async_dispatcher_connect(hass, SIGNAL_DEVICE_UPDATED, _discover)
-    )
-    for mac in list(hub.devices):
-        _discover(entry.entry_id, mac)
+    async_setup_device_discovery(hass, entry, hub, async_add_entities, _build)
 
 
 class EspNowFan(EspNowEntity, FanEntity):
@@ -53,6 +41,7 @@ class EspNowFan(EspNowEntity, FanEntity):
     )
     _attr_preset_modes = PRESET_MODES
     _attr_speed_count = 100
+    _requires_cap = "fan"
 
     def __init__(self, hub: EspNowHub, device: EspNowDevice) -> None:
         super().__init__(hub, device, "fan")
@@ -62,7 +51,7 @@ class EspNowFan(EspNowEntity, FanEntity):
         mode = str(self._device.state.get("fan_mode", "off")).lower()
         if mode in ("off", ""):
             return False
-        if mode in ("on", "auto", "smart", "low", "medium", "high"):
+        if mode in PRESET_MODES:
             return True
         return (self.percentage or 0) > 0
 
